@@ -1,0 +1,11 @@
+{
+  "id": "loan-fixture-1",
+  "name": "Financiamento",
+  "currencyCode": "BRL",
+  "principal": 50000,
+  "outstandingBalance": 42000.5,
+  "installment": 1450.75,
+  "interestRate": 0.0125,
+  "nextDueDate": "2026-10-10T00:00:00Z",
+  "remainingInstallments": 36
+}

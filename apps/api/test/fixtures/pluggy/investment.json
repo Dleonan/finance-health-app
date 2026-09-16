@@ -1,0 +1,7 @@
+{
+  "id": "investment-fixture-1",
+  "type": "CDB",
+  "name": "Reserva",
+  "balance": 10000.12,
+  "currencyCode": "BRL"
+}

@@ -1,0 +1,1 @@
+ALTER TYPE "DataAvailability" ADD VALUE 'INSUFFICIENT_DATA';

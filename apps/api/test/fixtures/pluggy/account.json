@@ -1,0 +1,8 @@
+{
+  "id": "acc-fixture-1",
+  "name": "Conta principal",
+  "type": "CHECKING",
+  "balance": 1250.5,
+  "availableBalance": 1200.5,
+  "currencyCode": "BRL"
+}

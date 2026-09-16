@@ -1,0 +1,448 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum DataProvider {
+  PLUGGY
+}
+
+enum ConnectionStatus {
+  PENDING
+  CONNECTED
+  SYNCING
+  STALE
+  ERROR
+  REAUTH_REQUIRED
+  DISCONNECTED
+}
+
+enum AccountKind {
+  CHECKING
+  SAVINGS
+  CREDIT_CARD
+  INVESTMENT
+  LOAN
+  OTHER
+}
+
+enum TransactionDirection {
+  INFLOW
+  OUTFLOW
+}
+
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
+enum SyncRunStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+enum CreditCardBillStatus {
+  OPEN
+  CLOSED
+  PAID
+  OVERDUE
+  UNKNOWN
+}
+
+enum DataQuality {
+  COMPLETE
+  PARTIAL
+  STALE
+  ESTIMATED
+  UNAVAILABLE
+}
+
+enum DataAvailability {
+  AVAILABLE
+  UNAVAILABLE
+  ESTIMATED
+  STALE
+  INSUFFICIENT_HISTORY
+  INSUFFICIENT_DATA
+}
+
+enum Confidence {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum DataProvenance {
+  OBSERVED
+  ESTIMATED
+  USER_DECLARED
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  displayName  String?
+  timezone     String   @default("America/Sao_Paulo")
+  locale       String   @default("pt-BR")
+  baseCurrency String   @default("BRL")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sessions           Session[]
+  connections        Connection[]
+  budgets            Budget[]
+  goals              Goal[]
+  categories         Category[]
+  categoryRules      CategoryRule[]
+  manualFacts        ManualFact[]
+  financialSnapshots FinancialSnapshot[]
+  healthAssessments  FinancialHealthAssessment[]
+}
+
+model Session {
+  id               String    @id @default(cuid())
+  userId           String
+  refreshTokenHash String
+  deviceName       String?
+  createdAt        DateTime  @default(now())
+  expiresAt        DateTime
+  revokedAt        DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+}
+
+model Connection {
+  id               String           @id @default(cuid())
+  userId           String
+  provider         DataProvider     @default(PLUGGY)
+  providerItemId   String
+  institution      String?
+  status           ConnectionStatus @default(PENDING)
+  lastSyncedAt     DateTime?
+  lastErrorAt      DateTime?
+  lastErrorCode    String?
+  lastErrorMessage String?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accounts    Account[]
+  investments Investment[]
+  loans       Loan[]
+  syncRuns    SyncRun[]
+
+  @@unique([provider, providerItemId])
+  @@index([userId])
+}
+
+model Account {
+  id                 String       @id @default(cuid())
+  connectionId       String
+  provider           DataProvider @default(PLUGGY)
+  providerAccountId  String
+  name               String
+  kind               AccountKind
+  currency           String       @default("BRL")
+  currentBalance     Decimal?     @db.Decimal(18, 2)
+  availableBalance   Decimal?     @db.Decimal(18, 2)
+  creditLimit        Decimal?     @db.Decimal(18, 2)
+  lastProviderSyncAt DateTime?
+  transactionCursor  String?
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  connection       Connection               @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  transactions     Transaction[]
+  bills            CreditCardBill[]
+  balanceSnapshots AccountBalanceSnapshot[]
+
+  @@unique([connectionId, provider, providerAccountId])
+  @@index([connectionId])
+}
+
+model Transaction {
+  id                    String               @id @default(cuid())
+  accountId             String
+  provider              DataProvider         @default(PLUGGY)
+  providerTransactionId String
+  postedAt              DateTime
+  description           String
+  merchantRaw           String?
+  merchantNormalized    String?
+  amount                Decimal              @db.Decimal(18, 2)
+  direction             TransactionDirection
+  providerCategoryId    String?
+  userCategoryId        String?
+  status                String?
+  billId                String?
+  installmentNumber     Int?
+  installmentTotal      Int?
+  isTransfer            Boolean              @default(false)
+  isRecurringCandidate  Boolean              @default(false)
+  deletedAt             DateTime?
+  rawFingerprint        String?
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime             @updatedAt
+
+  account Account         @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  bill    CreditCardBill? @relation(fields: [billId], references: [id], onDelete: SetNull)
+
+  @@unique([accountId, provider, providerTransactionId])
+  @@index([accountId, postedAt])
+  @@index([postedAt])
+  @@index([userCategoryId])
+}
+
+model CreditCardBill {
+  id             String               @id @default(cuid())
+  accountId      String
+  provider       DataProvider         @default(PLUGGY)
+  providerBillId String
+  dueDate        DateTime
+  closingDate    DateTime?
+  totalAmount    Decimal              @db.Decimal(18, 2)
+  minimumPayment Decimal?             @db.Decimal(18, 2)
+  status         CreditCardBillStatus @default(UNKNOWN)
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
+
+  account      Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  transactions Transaction[]
+
+  @@unique([accountId, provider, providerBillId])
+  @@index([accountId, dueDate])
+}
+
+model Investment {
+  id                   String       @id @default(cuid())
+  connectionId         String
+  provider             DataProvider @default(PLUGGY)
+  providerInvestmentId String
+  type                 String
+  name                 String
+  currency             String       @default("BRL")
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+
+  connection Connection          @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  snapshots  InvestmentSnapshot[]
+
+  @@unique([connectionId, provider, providerInvestmentId])
+  @@index([connectionId])
+}
+
+model InvestmentSnapshot {
+  id           String   @id @default(cuid())
+  investmentId String
+  snapshotAt   DateTime
+  balance      Decimal  @db.Decimal(18, 2)
+  createdAt    DateTime @default(now())
+
+  investment Investment @relation(fields: [investmentId], references: [id], onDelete: Cascade)
+
+  @@unique([investmentId, snapshotAt])
+  @@index([investmentId, snapshotAt])
+}
+
+model Loan {
+  id                    String       @id @default(cuid())
+  connectionId          String
+  provider              DataProvider @default(PLUGGY)
+  providerLoanId        String
+  name                  String?
+  currency              String        @default("BRL")
+  principal             Decimal?     @db.Decimal(18, 2)
+  outstandingBalance    Decimal?     @db.Decimal(18, 2)
+  installment           Decimal?     @db.Decimal(18, 2)
+  interestRate          Decimal?     @db.Decimal(12, 6)
+  nextDueDate           DateTime?
+  remainingInstallments Int?
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
+
+  connection Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, provider, providerLoanId])
+  @@index([connectionId])
+}
+
+model AccountBalanceSnapshot {
+  id               String   @id @default(cuid())
+  accountId        String
+  snapshotAt       DateTime
+  currentBalance   Decimal? @db.Decimal(18, 2)
+  availableBalance Decimal? @db.Decimal(18, 2)
+  creditLimit      Decimal? @db.Decimal(18, 2)
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, snapshotAt])
+  @@index([accountId, snapshotAt])
+}
+
+model Budget {
+  id         String   @id @default(cuid())
+  userId     String
+  month      DateTime
+  categoryId String
+  limit      Decimal  @db.Decimal(18, 2)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, month, categoryId])
+}
+
+model Goal {
+  id            String   @id @default(cuid())
+  userId        String
+  name          String
+  targetAmount  Decimal  @db.Decimal(18, 2)
+  currentAmount Decimal  @default(0) @db.Decimal(18, 2)
+  targetDate    DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Category {
+  id       String  @id @default(cuid())
+  userId   String?
+  name     String
+  parentId String?
+  isSystem Boolean @default(false)
+
+  user     User?      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children Category[] @relation("CategoryTree")
+  budgets  Budget[]
+  rules    CategoryRule[]
+
+  @@unique([userId, name])
+  @@index([parentId])
+}
+
+model CategoryRule {
+  id         String   @id @default(cuid())
+  userId     String
+  categoryId String
+  field      String
+  operator   String
+  value      String
+  priority   Int      @default(0)
+  enabled    Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@index([userId, enabled, priority])
+}
+
+model ManualFact {
+  id         String         @id @default(cuid())
+  userId     String
+  key        String
+  value      Decimal?       @db.Decimal(18, 2)
+  textValue  String?
+  provenance DataProvenance @default(USER_DECLARED)
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key])
+}
+
+model WebhookEvent {
+  id           String             @id @default(cuid())
+  provider     DataProvider       @default(PLUGGY)
+  eventId      String
+  eventType    String
+  status       WebhookEventStatus @default(RECEIVED)
+  itemId       String?
+  clientUserId String?
+  resourceId   String?
+  receivedAt   DateTime           @default(now())
+  processedAt  DateTime?
+  attempts     Int                @default(0)
+  lastError    String?
+  payloadHash  String?
+
+  @@unique([provider, eventId])
+  @@index([status, receivedAt])
+}
+
+model SyncRun {
+  id                    String        @id @default(cuid())
+  connectionId          String
+  status                SyncRunStatus @default(QUEUED)
+  startedAt             DateTime?
+  finishedAt            DateTime?
+  accountsProcessed     Int           @default(0)
+  transactionsProcessed Int           @default(0)
+  billsProcessed        Int           @default(0)
+  investmentsProcessed  Int           @default(0)
+  loansProcessed        Int           @default(0)
+  errorCode             String?
+  errorMessage          String?
+  triggerEventId        String?
+  triggerEventType      String?
+  resourceId            String?
+  createdAt             DateTime      @default(now())
+
+  connection Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+  @@index([connectionId, status])
+}
+
+model FinancialSnapshot {
+  id              String      @id @default(cuid())
+  userId          String
+  snapshotAt      DateTime
+  liquidAssets    Decimal     @db.Decimal(18, 2)
+  investedAssets  Decimal     @db.Decimal(18, 2)
+  liabilities     Decimal     @db.Decimal(18, 2)
+  netWorth        Decimal     @db.Decimal(18, 2)
+  monthlyIncome   Decimal?    @db.Decimal(18, 2)
+  monthlyExpenses Decimal?    @db.Decimal(18, 2)
+  dataQuality     DataQuality @default(PARTIAL)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, snapshotAt])
+  @@index([userId, snapshotAt])
+}
+
+model FinancialHealthAssessment {
+  id           String           @id @default(cuid())
+  userId       String
+  calculatedAt DateTime         @default(now())
+  score        Int?
+  coverage     Decimal          @db.Decimal(5, 4)
+  confidence   Confidence
+  status       DataAvailability
+  version      String
+  components   Json
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, calculatedAt])
+}

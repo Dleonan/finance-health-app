@@ -1,0 +1,27 @@
+{
+  "expo": {
+    "name": "Finance Health",
+    "slug": "finance-health",
+    "scheme": "financehealth",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.example.financehealth",
+      "buildNumber": "1"
+    },
+    "android": {
+      "package": "com.example.financehealth"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Permitir que o Finance Health use o Face ID para desbloquear seus dados financeiros."
+        }
+      ]
+    ]
+  }
+}

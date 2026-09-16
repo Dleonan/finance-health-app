@@ -1,0 +1,8 @@
+{
+  "id": "bill-fixture-1",
+  "dueDate": "2026-09-25T00:00:00Z",
+  "closingDate": "2026-09-18T00:00:00Z",
+  "totalAmount": 840.25,
+  "minimumPayment": 84.03,
+  "status": "OPEN"
+}
