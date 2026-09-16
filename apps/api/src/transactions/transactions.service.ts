@@ -64,7 +64,7 @@ export class TransactionsService {
     installmentTotal: number | null;
     isTransfer: boolean;
     isRecurringCandidate: boolean;
-    account: { id: string; name: string; currency: string };
+    account: { id: string; name: string; currency: string | null };
   }) {
     return {
       id: row.id,

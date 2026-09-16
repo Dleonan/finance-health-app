@@ -4,7 +4,7 @@ export type Account = {
   id: string;
   name: string;
   kind: string;
-  currency: string;
+  currency: string | null;
   currentBalance: string | null;
   availableBalance: string | null;
   creditLimit: string | null;

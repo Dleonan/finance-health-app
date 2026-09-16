@@ -51,4 +51,14 @@ describe('PluggyAdapter', () => {
       'monetary value is invalid',
     );
   });
+
+  it('keeps missing provider currency and optional aggregates unknown', () => {
+    expect(adapter.mapAccount({ id: 'acc-1', type: 'CHECKING', balance: '10' }).currency).toBeNull();
+    expect(() =>
+      adapter.mapBill({ id: 'bill-1', dueDate: '2026-01-01T00:00:00.000Z' }),
+    ).toThrow('bill total amount is missing');
+    expect(() => adapter.mapInvestment({ id: 'investment-1' })).toThrow(
+      'investment balance is missing',
+    );
+  });
 });

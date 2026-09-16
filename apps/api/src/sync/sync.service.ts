@@ -1,5 +1,14 @@
-import { Injectable, Logger } from '@nestjs/common';
-import { DataProvider, SyncRunStatus, WebhookEventStatus } from '@prisma/client';
+import { Injectable, Logger, Optional } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import Decimal from 'decimal.js';
+import {
+  ConnectionStatus,
+  DataProvider,
+  DataQuality,
+  SyncRunStatus,
+  WebhookEventStatus,
+} from '@prisma/client';
+import type { Prisma } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
 import { PluggyAdapter } from '../integrations/pluggy/pluggy.adapter';
 import { ProviderDataError } from '../integrations/pluggy/pluggy.adapter';
@@ -9,6 +18,23 @@ import { normalizeMerchant } from './merchant-normalizer';
 import { MetricsService } from '../observability/metrics.service';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+type SyncCounters = {
+  accountsProcessed: number;
+  transactionsProcessed: number;
+  billsProcessed: number;
+  investmentsProcessed: number;
+  loansProcessed: number;
+};
+
+type SyncOutcome = {
+  counters: SyncCounters;
+  dataQuality: DataQuality;
+  dataQualityReasons?: string[];
+  connectionStatus?: ConnectionStatus;
+  connectionError?: { code: string; message: string };
+  persistSnapshot?: boolean;
+};
 
 @Injectable()
 export class SyncService {
@@ -20,54 +46,93 @@ export class SyncService {
     private readonly adapter: PluggyAdapter,
     private readonly summary: FinancialSummaryService,
     private readonly metrics: MetricsService,
+    @Optional() private readonly config?: ConfigService,
   ) {}
 
   async process(runId: string) {
     const startedAt = Date.now();
     const run = await this.prisma.syncRun.findUnique({
       where: { id: runId },
-      include: { connection: true },
+      include: { connection: true, webhookEvents: true },
     });
     if (!run || run.status !== SyncRunStatus.RUNNING) return;
     this.metrics.increment('sync_started_total');
-    if (run.triggerEventId) {
-      await this.prisma.webhookEvent.updateMany({
-        where: { provider: DataProvider.PLUGGY, eventId: run.triggerEventId },
-        data: { status: WebhookEventStatus.PROCESSING, attempts: { increment: 1 } },
-      });
+    const webhookEvents = run.webhookEvents;
+    const eventTypes = [
+      ...new Set(
+        [run.triggerEventType, ...webhookEvents.map((event) => event.eventType)]
+          .filter((event): event is string => !!event)
+          .map((event) => event.toLowerCase()),
+      ),
+    ];
+    const transactionIds = [
+      ...new Set([
+        ...webhookEvents.flatMap((event) => this.readStringArray(event.resourceIds)),
+        ...webhookEvents
+          .filter((event) => event.eventType.toLowerCase() === 'transactions/deleted')
+          .map((event) => event.resourceId)
+          .filter((id): id is string => !!id),
+        ...(eventTypes.includes('transactions/deleted') && run.resourceId ? [run.resourceId] : []),
+      ]),
+    ];
+    const updatedTransactionIdsByAccount = new Map<string, string[]>();
+    for (const event of webhookEvents) {
+      if (event.eventType.toLowerCase() !== 'transactions/updated' || !event.providerAccountId)
+        continue;
+      const ids = updatedTransactionIdsByAccount.get(event.providerAccountId) ?? [];
+      ids.push(...this.readStringArray(event.resourceIds));
+      if (event.resourceId) ids.push(event.resourceId);
+      updatedTransactionIdsByAccount.set(event.providerAccountId, [...new Set(ids)]);
     }
-
     try {
-      const counters = await this.syncConnection(
-        run.connectionId,
-        run.triggerEventType,
-        run.resourceId,
-      );
+      await this.markWebhookEvents(run.id, run.triggerEventId, WebhookEventStatus.PROCESSING);
+      const itemErrorCode =
+        this.providerErrorCode(webhookEvents) ??
+        (eventTypes.includes('item/error') ? run.errorCode : null);
+      const outcome = eventTypes.includes('item/deleted')
+        ? await this.handleItemDeleted()
+        : eventTypes.includes('item/error')
+          ? await this.handleItemError(itemErrorCode)
+          : await this.syncConnection(
+              run.connectionId,
+              eventTypes,
+              transactionIds,
+              updatedTransactionIdsByAccount,
+            );
       await this.prisma.syncRun.update({
         where: { id: run.id },
-        data: { ...counters, status: SyncRunStatus.SUCCEEDED, finishedAt: new Date() },
+        data: {
+          ...outcome.counters,
+          status: SyncRunStatus.SUCCEEDED,
+          finishedAt: new Date(),
+          nextAttemptAt: null,
+          dataQuality: outcome.dataQuality,
+          dataQualityReasons: outcome.dataQualityReasons,
+        },
       });
       await this.prisma.connection.update({
         where: { id: run.connectionId },
         data: {
-          status: 'CONNECTED',
-          lastSyncedAt: new Date(),
-          lastErrorAt: null,
-          lastErrorCode: null,
-          lastErrorMessage: null,
+          status: outcome.connectionStatus ?? ConnectionStatus.CONNECTED,
+          ...(outcome.connectionStatus
+            ? {}
+            : {
+                lastSyncedAt: new Date(),
+                lastErrorAt: null,
+                lastErrorCode: null,
+                lastErrorMessage: null,
+              }),
+          ...(outcome.connectionError
+            ? {
+                lastErrorAt: new Date(),
+                lastErrorCode: outcome.connectionError.code,
+                lastErrorMessage: outcome.connectionError.message,
+              }
+            : {}),
         },
       });
-      if (run.triggerEventId) {
-        await this.prisma.webhookEvent.updateMany({
-          where: { provider: DataProvider.PLUGGY, eventId: run.triggerEventId },
-          data: {
-            status: WebhookEventStatus.PROCESSED,
-            processedAt: new Date(),
-            attempts: { increment: 1 },
-          },
-        });
-      }
-      await this.summary.persistSnapshot(run.connection.userId);
+      await this.markWebhookEvents(run.id, run.triggerEventId, WebhookEventStatus.PROCESSED);
+      if (outcome.persistSnapshot !== false) await this.summary.persistSnapshot(run.connection.userId);
       this.metrics.increment('sync_completed_total');
       this.metrics.observe('sync_duration_ms', Date.now() - startedAt);
     } catch (error) {
@@ -76,45 +141,61 @@ export class SyncService {
       this.logger.error(
         `sync failed run=${run.id} connection=${run.connectionId} code=${errorCode}`,
       );
-      await this.prisma.syncRun.update({
-        where: { id: run.id },
-        data: {
-          status: SyncRunStatus.FAILED,
-          finishedAt: new Date(),
-          errorCode,
-          errorMessage: error instanceof Error ? error.message.slice(0, 300) : 'Unknown sync error',
-        },
-      });
-      await this.prisma.connection.update({
-        where: { id: run.connectionId },
-        data: {
-          status: 'ERROR',
-          lastErrorAt: new Date(),
-          lastErrorCode: errorCode,
-          lastErrorMessage: 'Sincronização indisponível',
-        },
-      });
-      if (run.triggerEventId) {
-        await this.prisma.webhookEvent.updateMany({
-          where: { provider: DataProvider.PLUGGY, eventId: run.triggerEventId },
+      if (this.shouldRetry(error, errorCode) && run.attempts < this.maxAttempts()) {
+        const nextAttemptAt = new Date(Date.now() + this.backoffMs(run.attempts));
+        await this.prisma.syncRun.update({
+          where: { id: run.id },
           data: {
-            status: WebhookEventStatus.FAILED,
-            processedAt: new Date(),
-            attempts: { increment: 1 },
-            lastError: errorCode,
+            status: SyncRunStatus.QUEUED,
+            finishedAt: null,
+            nextAttemptAt,
+            errorCode,
+            errorMessage: 'Temporary sync failure; retry scheduled',
           },
         });
+        await this.prisma.connection.update({
+          where: { id: run.connectionId },
+          data: { status: ConnectionStatus.PENDING },
+        });
+        await this.markWebhookEvents(
+          run.id,
+          run.triggerEventId,
+          WebhookEventStatus.RECEIVED,
+          'SYNC_RETRY_SCHEDULED',
+        );
+        this.metrics.increment('sync_retry_scheduled_total');
+      } else {
+        await this.prisma.syncRun.update({
+          where: { id: run.id },
+          data: {
+            status: SyncRunStatus.FAILED,
+            finishedAt: new Date(),
+            errorCode,
+            errorMessage: 'Sync failed after retry policy was exhausted',
+          },
+        });
+        await this.prisma.connection.update({
+          where: { id: run.connectionId },
+          data: {
+            status: ConnectionStatus.ERROR,
+            lastErrorAt: new Date(),
+            lastErrorCode: errorCode,
+            lastErrorMessage: 'Sincronização indisponível',
+          },
+        });
+        await this.markWebhookEvents(run.id, run.triggerEventId, WebhookEventStatus.FAILED, errorCode);
+        this.metrics.increment('sync_failed_total');
       }
-      this.metrics.increment('sync_failed_total');
       this.metrics.observe('sync_duration_ms', Date.now() - startedAt);
     }
   }
 
   private async syncConnection(
     connectionId: string,
-    triggerEventType?: string | null,
-    resourceId?: string | null,
-  ) {
+    eventTypes: string[],
+    transactionIds: string[],
+    updatedTransactionIdsByAccount: Map<string, string[]>,
+  ): Promise<SyncOutcome> {
     const connection = await this.prisma.connection.findUniqueOrThrow({
       where: { id: connectionId },
     });
@@ -139,9 +220,23 @@ export class SyncService {
     let accountsProcessed = 0;
     let transactionsProcessed = 0;
     let billsProcessed = 0;
+    let optionalDataUnavailable = false;
+    const dataQualityReasons: string[] = [];
+    if (!providerAccounts.length) {
+      optionalDataUnavailable = true;
+      dataQualityReasons.push('ACCOUNTS_UNAVAILABLE');
+    }
 
     for (const rawAccount of providerAccounts) {
       const mappedAccount = this.adapter.mapAccount(rawAccount);
+      if (!mappedAccount.currency) {
+        optionalDataUnavailable = true;
+        dataQualityReasons.push('ACCOUNT_CURRENCY_UNAVAILABLE');
+      }
+      if (mappedAccount.currentBalance === null && mappedAccount.availableBalance === null) {
+        optionalDataUnavailable = true;
+        dataQualityReasons.push('ACCOUNT_BALANCE_UNAVAILABLE');
+      }
       const account = await this.prisma.account.upsert({
         where: {
           connectionId_provider_providerAccountId: {
@@ -192,10 +287,14 @@ export class SyncService {
 
       const billMap = new Map<string, string>();
       if (mappedAccount.kind === 'CREDIT_CARD') {
-        const providerBills = await this.optional(() =>
+        const billsResult = await this.optional('bills', () =>
           this.pluggy.fetchBills(mappedAccount.providerAccountId),
         );
-        for (const rawBill of providerBills) {
+        if (billsResult.error) {
+          optionalDataUnavailable = true;
+          dataQualityReasons.push(billsResult.error);
+        }
+        for (const rawBill of billsResult.data ?? []) {
           const bill = this.adapter.mapBill(rawBill);
           const persisted = await this.prisma.creditCardBill.upsert({
             where: {
@@ -213,14 +312,14 @@ export class SyncService {
         }
       }
 
-      const providerTransactions = await this.pluggy.fetchAllTransactions(
-        mappedAccount.providerAccountId,
-        dateFrom,
-      );
+      const updatedIds = updatedTransactionIdsByAccount.get(mappedAccount.providerAccountId) ?? [];
+      const providerTransactions = updatedIds.length
+        ? await this.pluggy.fetchTransactionsByIds(mappedAccount.providerAccountId, updatedIds)
+        : await this.pluggy.fetchAllTransactions(mappedAccount.providerAccountId, dateFrom);
       const normalizedTransactions = providerTransactions.map((raw) =>
         this.adapter.mapTransaction(raw),
       );
-      const recurringKeys = this.recurringKeys(normalizedTransactions);
+      const recurringIds = this.recurringTransactionIds(normalizedTransactions);
       for (const transaction of normalizedTransactions) {
         const merchantNormalized = normalizeMerchant(
           transaction.merchantRaw ?? transaction.description,
@@ -257,7 +356,7 @@ export class SyncService {
             installmentNumber: transaction.installmentNumber,
             installmentTotal: transaction.installmentTotal,
             isTransfer: transaction.isTransfer,
-            isRecurringCandidate: recurringKeys.has(`${merchantNormalized}|${transaction.amount}`),
+            isRecurringCandidate: recurringIds.has(transaction.providerTransactionId),
             deletedAt: null,
           },
           update: {
@@ -276,7 +375,7 @@ export class SyncService {
             installmentNumber: transaction.installmentNumber,
             installmentTotal: transaction.installmentTotal,
             isTransfer: transaction.isTransfer,
-            isRecurringCandidate: recurringKeys.has(`${merchantNormalized}|${transaction.amount}`),
+            isRecurringCandidate: recurringIds.has(transaction.providerTransactionId),
             deletedAt: null,
           },
         });
@@ -285,21 +384,25 @@ export class SyncService {
       }
     }
 
-    if (triggerEventType?.includes('deleted') && resourceId) {
+    if (eventTypes.includes('transactions/deleted') && transactionIds.length) {
       await this.prisma.transaction.updateMany({
         where: {
           provider: DataProvider.PLUGGY,
-          providerTransactionId: resourceId,
+          providerTransactionId: { in: transactionIds },
           account: { connectionId },
         },
         data: { deletedAt: syncAt },
       });
     }
 
-    const providerInvestments = await this.optional(() =>
+    const investmentsResult = await this.optional('investments', () =>
       this.pluggy.fetchInvestments(connection.providerItemId),
     );
-    for (const rawInvestment of providerInvestments) {
+    if (investmentsResult.error) {
+      optionalDataUnavailable = true;
+      dataQualityReasons.push(investmentsResult.error);
+    }
+    for (const rawInvestment of investmentsResult.data ?? []) {
       const investment = this.adapter.mapInvestment(rawInvestment);
       const persisted = await this.prisma.investment.upsert({
         where: {
@@ -319,10 +422,14 @@ export class SyncService {
       });
     }
 
-    const providerLoans = await this.optional(() =>
+    const loansResult = await this.optional('loans', () =>
       this.pluggy.fetchLoans(connection.providerItemId),
     );
-    for (const rawLoan of providerLoans) {
+    if (loansResult.error) {
+      optionalDataUnavailable = true;
+      dataQualityReasons.push(loansResult.error);
+    }
+    for (const rawLoan of loansResult.data ?? []) {
       const loan = this.adapter.mapLoan(rawLoan);
       await this.prisma.loan.upsert({
         where: {
@@ -340,31 +447,203 @@ export class SyncService {
     await this.detectInternalTransfers(connection.userId);
 
     return {
-      accountsProcessed,
-      transactionsProcessed,
-      billsProcessed,
-      investmentsProcessed: providerInvestments.length,
-      loansProcessed: providerLoans.length,
+      counters: {
+        accountsProcessed,
+        transactionsProcessed,
+        billsProcessed,
+        investmentsProcessed: investmentsResult.data?.length ?? 0,
+        loansProcessed: loansResult.data?.length ?? 0,
+      },
+      dataQuality: optionalDataUnavailable ? DataQuality.PARTIAL : DataQuality.COMPLETE,
+      dataQualityReasons: [...new Set(dataQualityReasons)],
     };
   }
 
-  private async optional<T>(operation: () => Promise<T[]>) {
+  private async optional<T>(label: string, operation: () => Promise<T[]>) {
     try {
-      return await operation();
+      return { data: await operation(), error: null };
     } catch {
-      return [];
+      this.metrics.increment(`sync_optional_${label}_unavailable_total`);
+      return { data: null, error: `${label.toUpperCase()}_UNAVAILABLE` };
     }
   }
 
-  private recurringKeys(
-    transactions: Array<{ merchantRaw: string | null; description: string; amount: string }>,
+  private async handleItemDeleted(): Promise<SyncOutcome> {
+    return {
+      counters: {
+        accountsProcessed: 0,
+        transactionsProcessed: 0,
+        billsProcessed: 0,
+        investmentsProcessed: 0,
+        loansProcessed: 0,
+      },
+      dataQuality: DataQuality.UNAVAILABLE,
+      dataQualityReasons: ['ITEM_DELETED'],
+      connectionStatus: ConnectionStatus.DISCONNECTED,
+      connectionError: {
+        code: 'ITEM_DELETED',
+        message: 'A conexão foi removida pelo provedor.',
+      },
+      persistSnapshot: false,
+    };
+  }
+
+  private async handleItemError(
+    providerErrorCode: string | null,
+  ): Promise<SyncOutcome> {
+    const code = providerErrorCode ?? 'PROVIDER_ITEM_ERROR';
+    const status = this.requiresReauthentication(code)
+      ? ConnectionStatus.REAUTH_REQUIRED
+      : ConnectionStatus.ERROR;
+    return {
+      counters: {
+        accountsProcessed: 0,
+        transactionsProcessed: 0,
+        billsProcessed: 0,
+        investmentsProcessed: 0,
+        loansProcessed: 0,
+      },
+      dataQuality: DataQuality.STALE,
+      dataQualityReasons: [code],
+      connectionStatus: status,
+      connectionError: {
+        code,
+        message:
+          status === ConnectionStatus.REAUTH_REQUIRED
+            ? 'A conexão precisa ser autorizada novamente.'
+            : 'A instituição reportou um erro na sincronização.',
+      },
+      persistSnapshot: false,
+    };
+  }
+
+  private requiresReauthentication(code: string) {
+    return new Set([
+      'REAUTH_REQUIRED',
+      'LOGIN_ERROR',
+      'INVALID_CREDENTIALS',
+      'USER_AUTHORIZATION_PENDING',
+      'USER_INPUT_TIMEOUT',
+      'PARAMETERS_NOT_PROVIDED',
+    ]).has(code.toUpperCase());
+  }
+
+  private providerErrorCode(events: Array<{ providerErrorCode: string | null }>) {
+    return events.find((event) => event.providerErrorCode)?.providerErrorCode ?? null;
+  }
+
+  private async markWebhookEvents(
+    syncRunId: string,
+    legacyEventId: string | null,
+    status: WebhookEventStatus,
+    lastError?: string,
   ) {
-    const counts = new Map<string, number>();
+    const where: Prisma.WebhookEventWhereInput = {
+      provider: DataProvider.PLUGGY,
+      OR: [
+        { syncRunId },
+        ...(legacyEventId ? [{ eventId: legacyEventId }] : []),
+      ],
+    };
+    const data: Prisma.WebhookEventUpdateManyMutationInput = { status };
+    if (status === WebhookEventStatus.PROCESSING)
+      data.attempts = { increment: 1 };
+    if (status === WebhookEventStatus.PROCESSED || status === WebhookEventStatus.FAILED)
+      data.processedAt = new Date();
+    if (status === WebhookEventStatus.RECEIVED) data.processedAt = null;
+    if (lastError !== undefined) data.lastError = lastError;
+    await this.prisma.webhookEvent.updateMany({ where, data });
+  }
+
+  private readStringArray(value: Prisma.JsonValue | null) {
+    if (!Array.isArray(value)) return [];
+    return value.filter((entry): entry is string => typeof entry === 'string' && !!entry.trim());
+  }
+
+  private maxAttempts() {
+    return Math.max(1, this.config?.get<number>('SYNC_MAX_ATTEMPTS', 3) ?? 3);
+  }
+
+  private backoffMs(attempts: number) {
+    const base = Math.max(100, this.config?.get<number>('SYNC_RETRY_BASE_MS', 5_000) ?? 5_000);
+    const maximum = Math.max(base, this.config?.get<number>('SYNC_RETRY_MAX_MS', 300_000) ?? 300_000);
+    return Math.min(maximum, base * 2 ** Math.max(0, attempts - 1));
+  }
+
+  private shouldRetry(error: unknown, errorCode: string) {
+    if (errorCode === 'PROVIDER_DATA_INVALID') return false;
+    const record = error && typeof error === 'object' ? (error as Record<string, unknown>) : {};
+    const response = record.response && typeof record.response === 'object'
+      ? (record.response as Record<string, unknown>)
+      : {};
+    const status = this.number(record.statusCode ?? record.status ?? response.status);
+    if (status === undefined) return true;
+    if (status === 408 || status === 409 || status === 425 || status === 429) return true;
+    return status >= 500;
+  }
+
+  private number(value: unknown) {
+    if (typeof value === 'number' && Number.isInteger(value)) return value;
+    if (typeof value === 'string' && /^\d+$/.test(value)) return Number(value);
+    return undefined;
+  }
+
+  private recurringTransactionIds(
+    transactions: Array<{
+      providerTransactionId: string;
+      merchantRaw: string | null;
+      description: string;
+      amount: string;
+      direction: 'INFLOW' | 'OUTFLOW';
+      postedAt: Date;
+      isTransfer: boolean;
+      installmentTotal: number | null;
+    }>,
+  ) {
+    const groups = new Map<string, typeof transactions>();
     for (const transaction of transactions) {
-      const key = `${normalizeMerchant(transaction.merchantRaw ?? transaction.description)}|${transaction.amount}`;
-      counts.set(key, (counts.get(key) ?? 0) + 1);
+      if (transaction.isTransfer || (transaction.installmentTotal ?? 0) > 1) continue;
+      const merchant = normalizeMerchant(transaction.merchantRaw ?? transaction.description);
+      if (!merchant || merchant.length < 3) continue;
+      const key = `${merchant}|${transaction.direction}`;
+      groups.set(key, [...(groups.get(key) ?? []), transaction]);
     }
-    return new Set([...counts.entries()].filter(([, count]) => count >= 2).map(([key]) => key));
+
+    const recurringIds = new Set<string>();
+    for (const group of groups.values()) {
+      const ordered = [...group].sort((left, right) => left.postedAt.getTime() - right.postedAt.getTime());
+      for (let index = 1; index < ordered.length; index += 1) {
+        const previous = ordered[index - 1];
+        const current = ordered[index];
+        const days = (current.postedAt.getTime() - previous.postedAt.getTime()) / DAY_MS;
+        if (!this.isRecurringCadence(days) || !this.isSimilarAmount(previous.amount, current.amount))
+          continue;
+        recurringIds.add(previous.providerTransactionId);
+        recurringIds.add(current.providerTransactionId);
+      }
+    }
+    return recurringIds;
+  }
+
+  private isRecurringCadence(days: number) {
+    return [
+      [5, 9],
+      [12, 16],
+      [25, 35],
+      [80, 100],
+    ].some(([min, max]) => days >= min && days <= max);
+  }
+
+  private isSimilarAmount(left: string, right: string) {
+    try {
+      const first = new Decimal(left);
+      const second = new Decimal(right);
+      const difference = first.minus(second).abs();
+      const tolerance = Decimal.max(new Decimal('2.00'), Decimal.min(first.abs(), second.abs()).mul('0.10'));
+      return difference.lte(tolerance);
+    } catch {
+      return false;
+    }
   }
 
   private readInstitution(item: Record<string, unknown>) {
@@ -397,20 +676,30 @@ export class SyncService {
   private async detectInternalTransfers(userId: string) {
     const rows = await this.prisma.transaction.findMany({
       where: { account: { connection: { userId } }, deletedAt: null, isTransfer: false },
-      include: { account: { select: { id: true } } },
+      include: { account: { select: { id: true, currency: true } } },
       orderBy: { postedAt: 'asc' },
       take: 5_000,
     });
     const inflows = rows.filter((row) => row.direction === 'INFLOW');
     const used = new Set<string>();
     for (const outflow of rows.filter((row) => row.direction === 'OUTFLOW')) {
-      const counterpart = inflows.find(
-        (inflow) =>
-          !used.has(inflow.id) &&
-          inflow.account.id !== outflow.account.id &&
-          inflow.amount.eq(outflow.amount) &&
-          Math.abs(inflow.postedAt.getTime() - outflow.postedAt.getTime()) <= 2 * DAY_MS,
-      );
+      if (!this.hasTransferSignal(outflow.description, outflow.merchantRaw)) continue;
+      const counterpart = inflows
+        .filter(
+          (inflow) =>
+            !used.has(inflow.id) &&
+            inflow.account.id !== outflow.account.id &&
+            !!outflow.account.currency &&
+            outflow.account.currency === inflow.account.currency &&
+            inflow.amount.eq(outflow.amount) &&
+            Math.abs(inflow.postedAt.getTime() - outflow.postedAt.getTime()) <= DAY_MS &&
+            this.hasTransferSignal(inflow.description, inflow.merchantRaw),
+        )
+        .sort(
+          (left, right) =>
+            Math.abs(left.postedAt.getTime() - outflow.postedAt.getTime()) -
+            Math.abs(right.postedAt.getTime() - outflow.postedAt.getTime()),
+        )[0];
       if (!counterpart) continue;
       used.add(counterpart.id);
       await this.prisma.transaction.updateMany({
@@ -418,5 +707,15 @@ export class SyncService {
         data: { isTransfer: true },
       });
     }
+  }
+
+  private hasTransferSignal(description: string, merchantRaw: string | null) {
+    const text = `${description} ${merchantRaw ?? ''}`
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+    return /\b(?:pix|ted|doc|transfer(?:encia)?|transf|envio|recebimento|deposito|movimentacao)\b/.test(
+      text,
+    );
   }
 }

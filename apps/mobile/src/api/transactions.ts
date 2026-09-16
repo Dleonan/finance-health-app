@@ -11,7 +11,7 @@ export function listTransactions(limit = 50, cursor?: string) {
       direction: string;
       postedAt: string;
       merchantNormalized: string | null;
-      account: { name: string; currency: string };
+      account: { name: string; currency: string | null };
     }>;
     nextCursor: string | null;
     hasMore: boolean;

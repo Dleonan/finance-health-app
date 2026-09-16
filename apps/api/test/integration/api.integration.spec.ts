@@ -5,6 +5,14 @@ import { NestFactory } from '@nestjs/core';
 import type { INestApplication } from '@nestjs/common';
 import { AppModule } from '../../src/app.module';
 
+jest.mock('pluggy-sdk', () => ({
+  PluggyClient: class {
+    fetchItem() {
+      return Promise.reject(new Error('provider disabled in integration test'));
+    }
+  },
+}));
+
 const maybeDescribe = process.env.DATABASE_URL ? describe : describe.skip;
 
 maybeDescribe('API integration', () => {
@@ -38,7 +46,7 @@ maybeDescribe('API integration', () => {
     expect(webhook.status).toBe(401);
   });
 
-  it('registers a user, serves a real dashboard and enforces connection ownership', async () => {
+  it('registers a user, serves a real dashboard and rejects unverifiable provider items', async () => {
     const suffix = randomUUID();
     const register = await fetch(`${baseUrl}/v1/auth/register`, {
       method: 'POST',
@@ -61,6 +69,13 @@ maybeDescribe('API integration', () => {
     };
     expect(dashboardBody.financialHealth.score).toBeNull();
     expect(dashboardBody.financialHealth.status).toBe('INSUFFICIENT_DATA');
+    expect(dashboardBody).toMatchObject({
+      availableCash: null,
+      investments: null,
+      liabilities: null,
+      netWorth: null,
+      dataQuality: 'UNAVAILABLE',
+    });
 
     const connection = await fetch(`${baseUrl}/v1/connections/pluggy/complete`, {
       method: 'POST',
@@ -70,22 +85,6 @@ maybeDescribe('API integration', () => {
       },
       body: JSON.stringify({ providerItemId: `item-${suffix}` }),
     });
-    expect(connection.status).toBe(201);
-    const connectionBody = (await connection.json()) as { id: string };
-
-    const secondRegister = await fetch(`${baseUrl}/v1/auth/register`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        email: `integration-second-${suffix}@example.com`,
-        password: 'IntegrationPass123!',
-      }),
-    });
-    const secondAuth = (await secondRegister.json()) as { accessToken: string };
-    const forbiddenDelete = await fetch(`${baseUrl}/v1/connections/${connectionBody.id}`, {
-      method: 'DELETE',
-      headers: { authorization: `Bearer ${secondAuth.accessToken}` },
-    });
-    expect(forbiddenDelete.status).toBe(404);
+    expect(connection.status).toBe(403);
   });
 });

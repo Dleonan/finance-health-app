@@ -142,6 +142,7 @@ model Connection {
   investments Investment[]
   loans       Loan[]
   syncRuns    SyncRun[]
+  webhookEvents WebhookEvent[]
 
   @@unique([provider, providerItemId])
   @@index([userId])
@@ -154,7 +155,7 @@ model Account {
   providerAccountId  String
   name               String
   kind               AccountKind
-  currency           String       @default("BRL")
+  currency           String?
   currentBalance     Decimal?     @db.Decimal(18, 2)
   availableBalance   Decimal?     @db.Decimal(18, 2)
   creditLimit        Decimal?     @db.Decimal(18, 2)
@@ -232,7 +233,7 @@ model Investment {
   providerInvestmentId String
   type                 String
   name                 String
-  currency             String       @default("BRL")
+  currency             String?
   createdAt            DateTime     @default(now())
   updatedAt            DateTime     @updatedAt
 
@@ -262,7 +263,7 @@ model Loan {
   provider              DataProvider @default(PLUGGY)
   providerLoanId        String
   name                  String?
-  currency              String        @default("BRL")
+  currency              String?
   principal             Decimal?     @db.Decimal(18, 2)
   outstandingBalance    Decimal?     @db.Decimal(18, 2)
   installment           Decimal?     @db.Decimal(18, 2)
@@ -378,14 +379,24 @@ model WebhookEvent {
   status       WebhookEventStatus @default(RECEIVED)
   itemId       String?
   clientUserId String?
+  providerAccountId String?
   resourceId   String?
+  resourceIds  Json?
+  providerErrorCode String?
+  connectionId String?
+  syncRunId    String?
   receivedAt   DateTime           @default(now())
   processedAt  DateTime?
   attempts     Int                @default(0)
   lastError    String?
   payloadHash  String?
 
+  connection Connection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+  syncRun    SyncRun?    @relation(fields: [syncRunId], references: [id], onDelete: SetNull)
+
   @@unique([provider, eventId])
+  @@index([connectionId, status, receivedAt])
+  @@index([syncRunId])
   @@index([status, receivedAt])
 }
 
@@ -393,6 +404,8 @@ model SyncRun {
   id                    String        @id @default(cuid())
   connectionId          String
   status                SyncRunStatus @default(QUEUED)
+  attempts              Int           @default(0)
+  nextAttemptAt         DateTime?
   startedAt             DateTime?
   finishedAt            DateTime?
   accountsProcessed     Int           @default(0)
@@ -405,9 +418,12 @@ model SyncRun {
   triggerEventId        String?
   triggerEventType      String?
   resourceId            String?
+  dataQuality           DataQuality?
+  dataQualityReasons    Json?
   createdAt             DateTime      @default(now())
 
   connection Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  webhookEvents WebhookEvent[]
 
   @@index([status, createdAt])
   @@index([connectionId, status])
@@ -417,10 +433,10 @@ model FinancialSnapshot {
   id              String      @id @default(cuid())
   userId          String
   snapshotAt      DateTime
-  liquidAssets    Decimal     @db.Decimal(18, 2)
-  investedAssets  Decimal     @db.Decimal(18, 2)
-  liabilities     Decimal     @db.Decimal(18, 2)
-  netWorth        Decimal     @db.Decimal(18, 2)
+  liquidAssets    Decimal?    @db.Decimal(18, 2)
+  investedAssets  Decimal?    @db.Decimal(18, 2)
+  liabilities     Decimal?    @db.Decimal(18, 2)
+  netWorth        Decimal?    @db.Decimal(18, 2)
   monthlyIncome   Decimal?    @db.Decimal(18, 2)
   monthlyExpenses Decimal?    @db.Decimal(18, 2)
   dataQuality     DataQuality @default(PARTIAL)
@@ -445,4 +461,13 @@ model FinancialHealthAssessment {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, calculatedAt])
+}
+
+model MetricAggregate {
+  name             String   @id
+  counter          BigInt   @default(0)
+  observationCount BigInt   @default(0)
+  totalMs          BigInt   @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 }

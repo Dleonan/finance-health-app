@@ -18,6 +18,9 @@ export function validateConfig(config: Record<string, unknown>) {
     'JWT_ACCESS_TTL_SECONDS',
     'REFRESH_TOKEN_TTL_DAYS',
     'SYNC_WORKER_INTERVAL_MS',
+    'SYNC_MAX_ATTEMPTS',
+    'SYNC_RETRY_BASE_MS',
+    'SYNC_RETRY_MAX_MS',
   ];
   const invalidNumeric = numeric.filter((key) => {
     const value = config[key];
@@ -35,6 +38,9 @@ export function validateConfig(config: Record<string, unknown>) {
     JWT_ACCESS_TTL_SECONDS: Number(config.JWT_ACCESS_TTL_SECONDS ?? 900),
     REFRESH_TOKEN_TTL_DAYS: Number(config.REFRESH_TOKEN_TTL_DAYS ?? 30),
     SYNC_WORKER_INTERVAL_MS: Number(config.SYNC_WORKER_INTERVAL_MS ?? 1_000),
+    SYNC_MAX_ATTEMPTS: Number(config.SYNC_MAX_ATTEMPTS ?? 3),
+    SYNC_RETRY_BASE_MS: Number(config.SYNC_RETRY_BASE_MS ?? 5_000),
+    SYNC_RETRY_MAX_MS: Number(config.SYNC_RETRY_MAX_MS ?? 300_000),
   };
 }
 

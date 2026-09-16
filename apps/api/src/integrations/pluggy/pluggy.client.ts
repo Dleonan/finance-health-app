@@ -2,6 +2,13 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PluggyClient } from 'pluggy-sdk';
 
+export class PluggyItemOwnershipError extends Error {
+  constructor() {
+    super('Provider item ownership could not be verified');
+    this.name = 'PluggyItemOwnershipError';
+  }
+}
+
 @Injectable()
 export class PluggyClientService {
   private client?: PluggyClient;
@@ -17,6 +24,22 @@ export class PluggyClientService {
     return this.getClient().fetchItem(itemId);
   }
 
+  async verifyItemOwnership(itemId: string, clientUserId: string) {
+    let item: unknown;
+    try {
+      item = await this.getClient().fetchItem(itemId);
+    } catch {
+      throw new PluggyItemOwnershipError();
+    }
+    const record = this.record(item);
+    const ownerId =
+      this.string(record.clientUserId) ??
+      this.string(record.userId) ??
+      this.nestedString(record.user, 'id');
+    if (!ownerId || ownerId !== clientUserId) throw new PluggyItemOwnershipError();
+    return { institution: this.readInstitution(record) };
+  }
+
   async fetchAccounts(itemId: string) {
     const page = await this.getClient().fetchAccounts(itemId);
     return page.results;
@@ -24,6 +47,17 @@ export class PluggyClientService {
 
   fetchAllTransactions(accountId: string, dateFrom: string) {
     return this.getClient().fetchAllTransactions(accountId, { dateFrom });
+  }
+
+  async fetchTransactionsByIds(accountId: string, transactionIds: string[]) {
+    const results = [];
+    for (let index = 0; index < transactionIds.length; index += 500) {
+      const page = await this.getClient().fetchTransactionsCursor(accountId, {
+        ids: transactionIds.slice(index, index + 500),
+      });
+      results.push(...page.results);
+    }
+    return results;
   }
 
   async fetchBills(accountId: string) {
@@ -50,5 +84,28 @@ export class PluggyClientService {
     }
     this.client = new PluggyClient({ clientId, clientSecret });
     return this.client;
+  }
+
+  private record(value: unknown) {
+    if (!value || typeof value !== 'object') throw new PluggyItemOwnershipError();
+    return value as Record<string, unknown>;
+  }
+
+  private string(value: unknown) {
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
+  }
+
+  private nestedString(value: unknown, key: string) {
+    return value && typeof value === 'object'
+      ? this.string((value as Record<string, unknown>)[key])
+      : null;
+  }
+
+  private readInstitution(item: Record<string, unknown>) {
+    const connector = item.connector;
+    if (connector && typeof connector === 'object') {
+      return this.string((connector as Record<string, unknown>).name);
+    }
+    return this.string(item.institution);
   }
 }

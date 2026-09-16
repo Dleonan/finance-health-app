@@ -16,7 +16,7 @@ export class InvestmentsService {
       name: row.name,
       type: row.type,
       currency: row.currency,
-      balance: row.snapshots[0]?.balance.toFixed(2) ?? '0.00',
+      balance: row.snapshots[0]?.balance.toFixed(2) ?? null,
       snapshotAt: row.snapshots[0]?.snapshotAt ?? null,
     }));
   }

@@ -198,8 +198,15 @@ function DashboardScreen() {
           <>
             <View style={styles.heroCard}>
               <Text style={styles.label}>Saldo disponível</Text>
-              <Text style={styles.money}>{money(dashboard.data.availableCash)}</Text>
+              <Text style={styles.money}>
+                {money(dashboard.data.availableCash, dashboard.data.currency)}
+              </Text>
               <Text style={styles.muted}>Qualidade: {dashboard.data.dataQuality}</Text>
+              {!!dashboard.data.dataQualityReasons.length && (
+                <Text style={styles.muted}>
+                  Motivos: {dashboard.data.dataQualityReasons.join(', ')}
+                </Text>
+              )}
             </View>
             <View style={styles.row}>
               <Metric
@@ -210,18 +217,29 @@ function DashboardScreen() {
                     : `${dashboard.data.financialHealth.score} / 100`
                 }
               />
-              <Metric title="Faturas abertas" value={money(dashboard.data.creditCardExposure)} />
+                <Metric
+                  title="Faturas abertas"
+                  value={money(dashboard.data.creditCardExposure, dashboard.data.currency)}
+                />
             </View>
             <View style={styles.row}>
-              <Metric title="Receitas no mês" value={money(dashboard.data.monthlyIncome)} />
-              <Metric title="Despesas no mês" value={money(dashboard.data.monthlyExpenses)} />
+                <Metric
+                  title="Receitas no mês"
+                  value={money(dashboard.data.monthlyIncome, dashboard.data.currency)}
+                />
+                <Metric
+                  title="Despesas no mês"
+                  value={money(dashboard.data.monthlyExpenses, dashboard.data.currency)}
+                />
             </View>
             <View style={styles.cardFull}>
               <Text style={styles.section}>Patrimônio</Text>
-              <Text style={styles.metric}>{money(dashboard.data.netWorth)}</Text>
+              <Text style={styles.metric}>
+                {money(dashboard.data.netWorth, dashboard.data.currency)}
+              </Text>
               <Text style={styles.muted}>
-                Investimentos {money(dashboard.data.investments)} · Dívidas{' '}
-                {money(dashboard.data.liabilities)}
+                Investimentos {money(dashboard.data.investments, dashboard.data.currency)} · Dívidas{' '}
+                {money(dashboard.data.liabilities, dashboard.data.currency)}
               </Text>
             </View>
           </>
@@ -280,7 +298,9 @@ function DashboardScreen() {
               <View key={account.id} style={styles.connection}>
                 <Text>{account.name}</Text>
                 <Text style={styles.muted}>
-                  {account.availableBalance === null ? '—' : money(account.availableBalance)}
+                  {account.availableBalance === null
+                    ? '—'
+                    : money(account.availableBalance, account.currency)}
                 </Text>
               </View>
             ))
@@ -309,7 +329,8 @@ function DashboardScreen() {
                   <Text style={styles.muted}>{transaction.account.name}</Text>
                 </View>
                 <Text style={transaction.direction === 'INFLOW' ? styles.inflow : styles.outflow}>
-                  {transaction.direction === 'INFLOW' ? '+' : '-'} {money(transaction.amount)}
+                   {transaction.direction === 'INFLOW' ? '+' : '-'}{' '}
+                   {money(transaction.amount, transaction.account.currency)}
                 </Text>
               </View>
             ))
@@ -374,10 +395,24 @@ function Centered({ children }: { children: ReactNode }) {
     </SafeAreaView>
   );
 }
-function money(value: string | null | undefined) {
+function money(value: string | null | undefined, currency: string | null | undefined) {
   const number = Number(value);
-  if (value === null || value === undefined || value === '' || !Number.isFinite(number)) return '—';
-  return new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(number);
+  if (
+    value === null ||
+    value === undefined ||
+    value === '' ||
+    !Number.isFinite(number) ||
+    !currency
+  )
+    return '—';
+  try {
+    return new Intl.NumberFormat('pt-BR', {
+      style: 'currency',
+      currency: currency.toUpperCase(),
+    }).format(number);
+  } catch {
+    return '—';
+  }
 }
 
 function connectionStatusLabel(status: string) {

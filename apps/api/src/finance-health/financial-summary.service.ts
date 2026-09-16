@@ -27,7 +27,17 @@ export class FinancialSummaryService {
       await Promise.all([
         this.prisma.account.findMany({
           where: { connection: { userId } },
-          include: { connection: true },
+          include: {
+            connection: {
+              include: {
+                syncRuns: {
+                  orderBy: { createdAt: 'desc' },
+                  take: 1,
+                  select: { status: true, dataQuality: true, dataQualityReasons: true },
+                },
+              },
+            },
+          },
         }),
         this.prisma.investment.findMany({
           where: { connection: { userId } },
@@ -63,64 +73,65 @@ export class FinancialSummaryService {
     const baseCurrencyAccounts = accounts.filter(
       (account) => account.currency === user.baseCurrency,
     );
-    const liquidAssets = baseCurrencyAccounts
-      .filter((account) => ['CHECKING', 'SAVINGS', 'OTHER'].includes(account.kind))
-      .reduce(
-        (sum, account) => sum.plus(account.availableBalance ?? account.currentBalance ?? zero()),
-        zero(),
-      );
-    const totalBalance = baseCurrencyAccounts.reduce(
-      (sum, account) => sum.plus(account.currentBalance ?? zero()),
-      zero(),
+    const liquidAssets = this.sumKnown(
+      baseCurrencyAccounts
+        .filter((account) => ['CHECKING', 'SAVINGS', 'OTHER'].includes(account.kind))
+        .map((account) => account.availableBalance ?? account.currentBalance),
     );
-    const investedAssets = investments
-      .filter((investment) => investment.currency === user.baseCurrency)
-      .reduce((sum, investment) => sum.plus(investment.snapshots[0]?.balance ?? zero()), zero());
+    const totalBalance = this.sumKnown(
+      baseCurrencyAccounts.map((account) => account.currentBalance),
+    );
+    const investedAssets = this.sumKnown(
+      investments
+        .filter((investment) => investment.currency === user.baseCurrency)
+        .map((investment) => investment.snapshots[0]?.balance),
+    );
     const baseCurrencyBills = bills.filter((bill) => bill.account.currency === user.baseCurrency);
     const baseCurrencyTransactions = transactions.filter(
       (transaction) => transaction.account.currency === user.baseCurrency,
     );
     const baseCurrencyLoans = loans.filter((loan) => loan.currency === user.baseCurrency);
-    const cardExposure = baseCurrencyBills.reduce(
-      (sum, bill) => sum.plus(bill.totalAmount),
-      zero(),
+    const cardExposure = this.sumKnown(baseCurrencyBills.map((bill) => bill.totalAmount));
+    const loanLiabilities = this.sumKnown(
+      baseCurrencyLoans.map((loan) => loan.outstandingBalance),
     );
-    const loanLiabilities = baseCurrencyLoans.reduce(
-      (sum, loan) => sum.plus(loan.outstandingBalance ?? zero()),
-      zero(),
+    const liabilities = this.addKnown(cardExposure, loanLiabilities);
+    const monthlyIncome = this.sumKnown(
+      baseCurrencyTransactions
+        .filter((transaction) => transaction.direction === 'INFLOW' && !transaction.isTransfer)
+        .map((transaction) => transaction.amount),
     );
-    const liabilities = loanLiabilities.plus(cardExposure);
-    const monthlyIncome = baseCurrencyTransactions
-      .filter((transaction) => transaction.direction === 'INFLOW' && !transaction.isTransfer)
-      .reduce((sum, transaction) => sum.plus(transaction.amount), zero());
-    const monthlyExpenses = baseCurrencyTransactions
-      .filter((transaction) => transaction.direction === 'OUTFLOW' && !transaction.isTransfer)
-      .reduce((sum, transaction) => sum.plus(transaction.amount), zero());
-    const upcomingCommitments = baseCurrencyBills
-      .filter((bill) => bill.dueDate >= now && bill.dueDate < next30)
-      .reduce((sum, bill) => sum.plus(bill.totalAmount), zero())
-      .plus(
-        baseCurrencyLoans
-          .filter(
-            (loan) => loan.nextDueDate && loan.nextDueDate >= now && loan.nextDueDate < next30,
-          )
-          .reduce((sum, loan) => sum.plus(loan.installment ?? zero()), zero()),
-      );
-    const debtService = baseCurrencyLoans.reduce(
-      (sum, loan) => sum.plus(loan.installment ?? zero()),
-      zero(),
+    const monthlyExpenses = this.sumKnown(
+      baseCurrencyTransactions
+        .filter((transaction) => transaction.direction === 'OUTFLOW' && !transaction.isTransfer)
+        .map((transaction) => transaction.amount),
     );
-    const hasLiquidAssets = baseCurrencyAccounts.some(
-      (account) => account.availableBalance !== null || account.currentBalance !== null,
+    const upcomingValues = [
+      ...baseCurrencyBills
+        .filter((bill) => bill.dueDate >= now && bill.dueDate < next30)
+        .map((bill) => bill.totalAmount),
+      ...baseCurrencyLoans
+        .filter(
+          (loan) => loan.nextDueDate && loan.nextDueDate >= now && loan.nextDueDate < next30,
+        )
+        .map((loan) => loan.installment),
+    ];
+    const upcomingCommitments = this.sumKnown(upcomingValues);
+    const debtService = this.sumKnown(baseCurrencyLoans.map((loan) => loan.installment));
+    const cardLimit = this.sumKnown(
+      baseCurrencyAccounts
+        .filter((account) => account.kind === 'CREDIT_CARD')
+        .map((account) => account.creditLimit),
     );
+    const hasLiquidAssets = liquidAssets !== null;
     const hasCurrentTransactions = baseCurrencyTransactions.length > 0;
-    const hasDebtService = baseCurrencyLoans.some((loan) => loan.installment !== null);
-    const hasUpcomingCommitments =
-      baseCurrencyBills.length > 0 ||
-      baseCurrencyLoans.some((loan) => loan.nextDueDate !== null && loan.installment !== null);
-    const hasCardLimit = baseCurrencyAccounts.some(
-      (account) => account.kind === 'CREDIT_CARD' && account.creditLimit !== null,
-    );
+    const hasDebtService = debtService !== null;
+    const hasUpcomingCommitments = upcomingCommitments !== null;
+    const hasCardLimit = cardLimit !== null;
+    const hasUnknownCurrency =
+      accounts.some((account) => account.currency === null) ||
+      investments.some((investment) => investment.currency === null) ||
+      loans.some((loan) => loan.currency === null);
     const monthlyHistory = this.monthlyHistory(historicalTransactions, user.timezone);
     const incomeVolatility = this.volatility(monthlyHistory.map((month) => month.income));
     const essentialExpenseVolatility = this.volatility(
@@ -128,10 +139,11 @@ export class FinancialSummaryService {
     );
     const historyMonths = monthlyHistory.length;
     const dataQuality = this.quality(
+      accounts,
       baseCurrencyAccounts,
-      baseCurrencyTransactions,
-      baseCurrencyBills,
+      hasUnknownCurrency,
     );
+    const dataQualityReasons = this.qualityReasons(accounts, baseCurrencyAccounts, hasUnknownCurrency);
     const observedMeta = (sources: string[], quality: DataQuality = dataQuality): MetricMeta => ({
       availability: quality === DataQuality.STALE ? 'STALE' : 'AVAILABLE',
       quality,
@@ -165,23 +177,18 @@ export class FinancialSummaryService {
             }
           : unavailableMeta(['transactions.current-month']);
     const input: FinancialHealthInputs = {
-      monthlyIncome: hasCurrentTransactions ? monthlyIncome.toFixed(2) : null,
-      monthlyExpenses: hasCurrentTransactions ? monthlyExpenses.toFixed(2) : null,
+      monthlyIncome: hasCurrentTransactions ? (monthlyIncome?.toFixed(2) ?? null) : null,
+      monthlyExpenses: hasCurrentTransactions ? (monthlyExpenses?.toFixed(2) ?? null) : null,
       essentialMonthlyExpenses:
         fact?.value !== null && fact?.value !== undefined
           ? fact.value.toFixed(2)
           : hasCurrentTransactions
-            ? monthlyExpenses.toFixed(2)
+            ? (monthlyExpenses?.toFixed(2) ?? null)
             : null,
-      liquidAssets: hasLiquidAssets ? liquidAssets.toFixed(2) : null,
-      monthlyDebtService: hasDebtService ? debtService.toFixed(2) : null,
-      revolvingOrCardBalance: baseCurrencyBills.length ? cardExposure.toFixed(2) : null,
-      totalCardLimit: hasCardLimit
-        ? baseCurrencyAccounts
-            .filter((account) => account.kind === 'CREDIT_CARD')
-            .reduce((sum, account) => sum.plus(account.creditLimit ?? zero()), zero())
-            .toFixed(2)
-        : null,
+      liquidAssets: hasLiquidAssets ? (liquidAssets?.toFixed(2) ?? null) : null,
+      monthlyDebtService: hasDebtService ? (debtService?.toFixed(2) ?? null) : null,
+      revolvingOrCardBalance: cardExposure?.toFixed(2) ?? null,
+      totalCardLimit: hasCardLimit ? cardLimit.toFixed(2) : null,
       upcoming30dCommitments: hasUpcomingCommitments ? upcomingCommitments.toFixed(2) : null,
       incomeVolatility: incomeVolatility?.toFixed(4) ?? null,
       essentialExpenseVolatility: essentialExpenseVolatility?.toFixed(4) ?? null,
@@ -218,18 +225,23 @@ export class FinancialSummaryService {
       },
     };
     const financialHealth = this.health.calculate(input);
+    const netWorth =
+      liquidAssets !== null && investedAssets !== null && liabilities !== null
+        ? liquidAssets.plus(investedAssets).minus(liabilities)
+        : null;
     return {
-      availableCash: liquidAssets.toFixed(2),
-      totalBalance: totalBalance.toFixed(2),
-      investments: investedAssets.toFixed(2),
-      liabilities: liabilities.toFixed(2),
-      netWorth: liquidAssets.plus(investedAssets).minus(liabilities).toFixed(2),
-      monthlyIncome: monthlyIncome.toFixed(2),
-      monthlyExpenses: monthlyExpenses.toFixed(2),
-      creditCardExposure: cardExposure.toFixed(2),
-      upcomingCommitments: upcomingCommitments.toFixed(2),
+      availableCash: this.formatDecimal(liquidAssets),
+      totalBalance: this.formatDecimal(totalBalance),
+      investments: this.formatDecimal(investedAssets),
+      liabilities: this.formatDecimal(liabilities),
+      netWorth: this.formatDecimal(netWorth),
+      monthlyIncome: this.formatDecimal(monthlyIncome),
+      monthlyExpenses: this.formatDecimal(monthlyExpenses),
+      creditCardExposure: this.formatDecimal(cardExposure),
+      upcomingCommitments: this.formatDecimal(upcomingCommitments),
       financialHealth,
       dataQuality,
+      dataQualityReasons,
       lastSyncedAt: this.latestSync(accounts),
       currency: user.baseCurrency,
     };
@@ -293,14 +305,84 @@ export class FinancialSummaryService {
   }
 
   private quality(
-    accounts: Array<{ connection: { status: string } }>,
-    transactions: unknown[],
-    bills: unknown[],
+    accounts: Array<{
+      currency: string | null;
+      connection: {
+        status: string;
+        syncRuns: Array<{ status: string; dataQuality: DataQuality | null }>;
+      };
+    }>,
+    baseCurrencyAccounts: Array<unknown>,
+    hasUnknownCurrency: boolean,
   ) {
     if (!accounts.length) return DataQuality.UNAVAILABLE;
-    if (accounts.some((account) => account.connection.status === 'STALE')) return DataQuality.STALE;
-    if (!transactions.length) return DataQuality.PARTIAL;
-    return bills.length ? DataQuality.COMPLETE : DataQuality.PARTIAL;
+    if (
+      accounts.some((account) =>
+        ['STALE', 'ERROR', 'REAUTH_REQUIRED', 'DISCONNECTED'].includes(account.connection.status),
+      )
+    )
+      return DataQuality.STALE;
+    if (accounts.some((account) => ['PENDING', 'SYNCING'].includes(account.connection.status)))
+      return DataQuality.PARTIAL;
+    if (hasUnknownCurrency || baseCurrencyAccounts.length !== accounts.length)
+      return DataQuality.PARTIAL;
+    const syncRuns = accounts
+      .flatMap((account) => account.connection.syncRuns)
+      .filter((run): run is { status: string; dataQuality: DataQuality | null } => !!run);
+    if (
+      !syncRuns.length ||
+      syncRuns.some((run) => run.status !== 'SUCCEEDED' || run.dataQuality !== DataQuality.COMPLETE)
+    )
+      return DataQuality.PARTIAL;
+    return DataQuality.COMPLETE;
+  }
+
+  private sumKnown(values: Array<Decimal | Prisma.Decimal | null | undefined>): Decimal | null {
+    if (!values.length || values.some((value) => value === null || value === undefined)) return null;
+    return values.reduce<Decimal>((sum, value) => sum.plus(String(value)), zero());
+  }
+
+  private addKnown(left: Decimal | null, right: Decimal | null) {
+    if (left === null && right === null) return null;
+    return (left ?? zero()).plus(right ?? zero());
+  }
+
+  private formatDecimal(value: Decimal | null) {
+    return value?.toFixed(2) ?? null;
+  }
+
+  private qualityReasons(
+    accounts: Array<{
+      currency: string | null;
+      connection: {
+        status: string;
+        syncRuns: Array<{ status: string; dataQuality: DataQuality | null; dataQualityReasons: Prisma.JsonValue | null }>;
+      };
+    }>,
+    baseCurrencyAccounts: Array<unknown>,
+    hasUnknownCurrency: boolean,
+  ) {
+    const reasons = new Set<string>();
+    if (!accounts.length) reasons.add('NO_ACCOUNTS');
+    if (hasUnknownCurrency) reasons.add('CURRENCY_UNAVAILABLE');
+    if (baseCurrencyAccounts.length !== accounts.length) reasons.add('BASE_CURRENCY_MISMATCH');
+    for (const account of accounts) {
+      if (['STALE', 'ERROR', 'REAUTH_REQUIRED', 'DISCONNECTED'].includes(account.connection.status))
+        reasons.add(`CONNECTION_${account.connection.status}`);
+      for (const run of account.connection.syncRuns) {
+        if (Array.isArray(run.dataQualityReasons)) {
+          for (const reason of run.dataQualityReasons) {
+            if (typeof reason === 'string') reasons.add(reason);
+          }
+        }
+        if (run.status !== 'SUCCEEDED') reasons.add('SYNC_NOT_COMPLETED');
+        if (run.dataQuality && run.dataQuality !== DataQuality.COMPLETE)
+          reasons.add(`SYNC_${run.dataQuality}`);
+      }
+    }
+    if (accounts.length && !accounts.some((account) => account.connection.syncRuns.length))
+      reasons.add('NO_COMPLETED_SYNC');
+    return [...reasons];
   }
 
   private monthlyHistory(

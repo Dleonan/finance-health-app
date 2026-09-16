@@ -6,7 +6,7 @@ export type NormalizedAccount = {
   providerAccountId: string;
   name: string;
   kind: 'CHECKING' | 'SAVINGS' | 'CREDIT_CARD' | 'INVESTMENT' | 'LOAN' | 'OTHER';
-  currency: string;
+  currency: string | null;
   currentBalance: string | null;
   availableBalance: string | null;
   creditLimit: string | null;
@@ -41,13 +41,13 @@ export type NormalizedInvestment = {
   type: string;
   name: string;
   balance: string;
-  currency: string;
+  currency: string | null;
 };
 
 export type NormalizedLoan = {
   providerLoanId: string;
   name: string | null;
-  currency: string;
+  currency: string | null;
   principal: string | null;
   outstandingBalance: string | null;
   installment: string | null;
@@ -84,7 +84,7 @@ export class PluggyAdapter {
       providerAccountId: this.requiredString(record.id, 'account id'),
       name: this.string(record.name) ?? 'Conta sem nome',
       kind,
-      currency: this.string(record.currencyCode) ?? this.string(record.currency) ?? 'BRL',
+      currency: this.currency(record),
       currentBalance: this.decimal(record.balance),
       availableBalance: this.decimal(record.availableBalance),
       creditLimit: this.decimal(
@@ -143,7 +143,10 @@ export class PluggyAdapter {
         record.closeDate || record.closingDate
           ? this.date(record.closeDate ?? record.closingDate, 'bill closing date')
           : null,
-      totalAmount: this.decimal(record.totalAmount ?? record.amount) ?? '0.00',
+      totalAmount: this.requiredDecimal(
+        record.totalAmount ?? record.amount,
+        'bill total amount',
+      ),
       minimumPayment: this.decimal(record.minimumPayment ?? record.minPayment),
       status:
         status === 'OPEN' || status === 'CLOSED' || status === 'PAID' || status === 'OVERDUE'
@@ -158,8 +161,8 @@ export class PluggyAdapter {
       providerInvestmentId: this.requiredString(record.id, 'investment id'),
       type: this.string(record.type) ?? 'OTHER',
       name: this.string(record.name) ?? 'Investimento sem nome',
-      balance: this.decimal(record.balance ?? record.amount) ?? '0.00',
-      currency: this.string(record.currencyCode) ?? this.string(record.currency) ?? 'BRL',
+      balance: this.requiredDecimal(record.balance ?? record.amount, 'investment balance'),
+      currency: this.currency(record),
     };
   }
 
@@ -168,7 +171,7 @@ export class PluggyAdapter {
     return {
       providerLoanId: this.requiredString(record.id, 'loan id'),
       name: this.string(record.name),
-      currency: this.string(record.currencyCode) ?? this.string(record.currency) ?? 'BRL',
+      currency: this.currency(record),
       principal: this.decimal(record.principal ?? record.originalAmount),
       outstandingBalance: this.decimal(
         record.outstandingBalance ?? record.outstanding ?? record.balance,
@@ -192,6 +195,17 @@ export class PluggyAdapter {
 
   private string(value: unknown) {
     return typeof value === 'string' && value.trim() ? value.trim() : null;
+  }
+
+  private currency(record: ProviderRecord) {
+    const value = this.string(record.currencyCode) ?? this.string(record.currency);
+    return value?.toUpperCase() ?? null;
+  }
+
+  private requiredDecimal(value: unknown, label: string) {
+    const result = this.decimal(value);
+    if (result === null) throw new ProviderDataError(`Provider ${label} is missing`);
+    return result;
   }
 
   private requiredString(value: unknown, label: string) {

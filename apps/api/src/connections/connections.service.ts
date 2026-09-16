@@ -1,7 +1,15 @@
-import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { DataProvider } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
-import { PluggyClientService } from '../integrations/pluggy/pluggy.client';
+import {
+  PluggyClientService,
+  PluggyItemOwnershipError,
+} from '../integrations/pluggy/pluggy.client';
 import { SyncQueueService } from '../sync/sync-queue.service';
 import type { CompleteConnectionDto } from './dto/complete-connection.dto';
 
@@ -45,6 +53,15 @@ export class ConnectionsService {
   }
 
   async complete(userId: string, dto: CompleteConnectionDto) {
+    let verifiedItem: { institution: string | null };
+    try {
+      verifiedItem = await this.pluggy.verifyItemOwnership(dto.providerItemId, userId);
+    } catch (error) {
+      if (error instanceof PluggyItemOwnershipError)
+        throw new ForbiddenException('Provider item does not belong to this user');
+      throw new ConflictException('Provider item could not be verified');
+    }
+
     const existing = await this.prisma.connection.findUnique({
       where: {
         provider_providerItemId: {
@@ -67,11 +84,11 @@ export class ConnectionsService {
         userId,
         provider: DataProvider.PLUGGY,
         providerItemId: dto.providerItemId,
-        institution: dto.institution,
+        institution: verifiedItem.institution ?? dto.institution,
         status: 'PENDING',
       },
       update: {
-        institution: dto.institution,
+        institution: verifiedItem.institution ?? dto.institution,
         status: 'PENDING',
         lastErrorAt: null,
         lastErrorCode: null,
