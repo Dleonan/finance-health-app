@@ -20,7 +20,7 @@ export class SyncQueueService {
 
   async enqueue(connectionId: string, trigger: SyncTrigger = {}, db: QueueDb = this.prisma) {
     const existing = await db.syncRun.findFirst({
-      where: { connectionId, status: { in: [SyncRunStatus.QUEUED, SyncRunStatus.RUNNING] } },
+      where: { connectionId, status: SyncRunStatus.QUEUED },
       orderBy: { createdAt: 'asc' },
     });
     if (existing) {
@@ -46,7 +46,7 @@ export class SyncQueueService {
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
         const run = await db.syncRun.findFirstOrThrow({
-          where: { connectionId, status: { in: [SyncRunStatus.QUEUED, SyncRunStatus.RUNNING] } },
+          where: { connectionId, status: SyncRunStatus.QUEUED },
           orderBy: { createdAt: 'asc' },
         });
         await this.linkWebhookEvent(db, run.id, connectionId, trigger.triggerEventId);

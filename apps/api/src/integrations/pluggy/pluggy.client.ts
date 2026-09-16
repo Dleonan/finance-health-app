@@ -9,6 +9,16 @@ export class PluggyItemOwnershipError extends Error {
   }
 }
 
+export class PluggyProviderUnavailableError extends Error {
+  readonly statusCode?: number;
+
+  constructor(statusCode?: number) {
+    super('Provider item could not be fetched');
+    this.name = 'PluggyProviderUnavailableError';
+    this.statusCode = statusCode;
+  }
+}
+
 @Injectable()
 export class PluggyClientService {
   private client?: PluggyClient;
@@ -28,8 +38,8 @@ export class PluggyClientService {
     let item: unknown;
     try {
       item = await this.getClient().fetchItem(itemId);
-    } catch {
-      throw new PluggyItemOwnershipError();
+    } catch (error) {
+      throw new PluggyProviderUnavailableError(this.providerStatus(error));
     }
     const record = this.record(item);
     const ownerId =
@@ -107,5 +117,18 @@ export class PluggyClientService {
       return this.string((connector as Record<string, unknown>).name);
     }
     return this.string(item.institution);
+  }
+
+  private providerStatus(error: unknown) {
+    if (!error || typeof error !== 'object') return undefined;
+    const record = error as Record<string, unknown>;
+    const response =
+      record.response && typeof record.response === 'object'
+        ? (record.response as Record<string, unknown>)
+        : undefined;
+    const status = record.statusCode ?? record.status ?? response?.status;
+    if (typeof status === 'number' && Number.isInteger(status)) return status;
+    if (typeof status === 'string' && /^\d+$/.test(status)) return Number(status);
+    return undefined;
   }
 }

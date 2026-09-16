@@ -3,12 +3,14 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { DataProvider } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
 import {
   PluggyClientService,
   PluggyItemOwnershipError,
+  PluggyProviderUnavailableError,
 } from '../integrations/pluggy/pluggy.client';
 import { SyncQueueService } from '../sync/sync-queue.service';
 import type { CompleteConnectionDto } from './dto/complete-connection.dto';
@@ -59,6 +61,8 @@ export class ConnectionsService {
     } catch (error) {
       if (error instanceof PluggyItemOwnershipError)
         throw new ForbiddenException('Provider item does not belong to this user');
+      if (error instanceof PluggyProviderUnavailableError)
+        throw new ServiceUnavailableException('Provider item could not be verified');
       throw new ConflictException('Provider item could not be verified');
     }
 

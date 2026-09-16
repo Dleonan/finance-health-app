@@ -36,6 +36,10 @@ type SyncOutcome = {
   persistSnapshot?: boolean;
 };
 
+type OptionalFetchResult<T> =
+  | { status: 'AVAILABLE'; data: T[] }
+  | { status: 'UNAVAILABLE'; data: null; reason: string };
+
 @Injectable()
 export class SyncService {
   private readonly logger = new Logger(SyncService.name);
@@ -58,6 +62,7 @@ export class SyncService {
     if (!run || run.status !== SyncRunStatus.RUNNING) return;
     this.metrics.increment('sync_started_total');
     const webhookEvents = run.webhookEvents;
+    const processedWebhookEventIds = webhookEvents.map((event) => event.id);
     const eventTypes = [
       ...new Set(
         [run.triggerEventType, ...webhookEvents.map((event) => event.eventType)]
@@ -65,16 +70,11 @@ export class SyncService {
           .map((event) => event.toLowerCase()),
       ),
     ];
-    const transactionIds = [
-      ...new Set([
-        ...webhookEvents.flatMap((event) => this.readStringArray(event.resourceIds)),
-        ...webhookEvents
-          .filter((event) => event.eventType.toLowerCase() === 'transactions/deleted')
-          .map((event) => event.resourceId)
-          .filter((id): id is string => !!id),
-        ...(eventTypes.includes('transactions/deleted') && run.resourceId ? [run.resourceId] : []),
-      ]),
-    ];
+    const deletedTransactionIds = this.deletedTransactionIds(
+      webhookEvents,
+      run.triggerEventType,
+      run.resourceId,
+    );
     const updatedTransactionIdsByAccount = new Map<string, string[]>();
     for (const event of webhookEvents) {
       if (event.eventType.toLowerCase() !== 'transactions/updated' || !event.providerAccountId)
@@ -85,7 +85,11 @@ export class SyncService {
       updatedTransactionIdsByAccount.set(event.providerAccountId, [...new Set(ids)]);
     }
     try {
-      await this.markWebhookEvents(run.id, run.triggerEventId, WebhookEventStatus.PROCESSING);
+      await this.markWebhookEvents(
+        processedWebhookEventIds,
+        run.triggerEventId,
+        WebhookEventStatus.PROCESSING,
+      );
       const itemErrorCode =
         this.providerErrorCode(webhookEvents) ??
         (eventTypes.includes('item/error') ? run.errorCode : null);
@@ -96,7 +100,7 @@ export class SyncService {
           : await this.syncConnection(
               run.connectionId,
               eventTypes,
-              transactionIds,
+              deletedTransactionIds,
               updatedTransactionIdsByAccount,
             );
       await this.prisma.syncRun.update({
@@ -131,7 +135,11 @@ export class SyncService {
             : {}),
         },
       });
-      await this.markWebhookEvents(run.id, run.triggerEventId, WebhookEventStatus.PROCESSED);
+      await this.markWebhookEvents(
+        processedWebhookEventIds,
+        run.triggerEventId,
+        WebhookEventStatus.PROCESSED,
+      );
       if (outcome.persistSnapshot !== false) await this.summary.persistSnapshot(run.connection.userId);
       this.metrics.increment('sync_completed_total');
       this.metrics.observe('sync_duration_ms', Date.now() - startedAt);
@@ -158,7 +166,7 @@ export class SyncService {
           data: { status: ConnectionStatus.PENDING },
         });
         await this.markWebhookEvents(
-          run.id,
+          processedWebhookEventIds,
           run.triggerEventId,
           WebhookEventStatus.RECEIVED,
           'SYNC_RETRY_SCHEDULED',
@@ -183,7 +191,12 @@ export class SyncService {
             lastErrorMessage: 'Sincronização indisponível',
           },
         });
-        await this.markWebhookEvents(run.id, run.triggerEventId, WebhookEventStatus.FAILED, errorCode);
+        await this.markWebhookEvents(
+          processedWebhookEventIds,
+          run.triggerEventId,
+          WebhookEventStatus.FAILED,
+          errorCode,
+        );
         this.metrics.increment('sync_failed_total');
       }
       this.metrics.observe('sync_duration_ms', Date.now() - startedAt);
@@ -193,7 +206,7 @@ export class SyncService {
   private async syncConnection(
     connectionId: string,
     eventTypes: string[],
-    transactionIds: string[],
+    deletedTransactionIds: string[],
     updatedTransactionIdsByAccount: Map<string, string[]>,
   ): Promise<SyncOutcome> {
     const connection = await this.prisma.connection.findUniqueOrThrow({
@@ -290,30 +303,32 @@ export class SyncService {
         const billsResult = await this.optional('bills', () =>
           this.pluggy.fetchBills(mappedAccount.providerAccountId),
         );
-        if (billsResult.error) {
+        if (billsResult.status === 'UNAVAILABLE') {
           optionalDataUnavailable = true;
-          dataQualityReasons.push(billsResult.error);
+          dataQualityReasons.push(billsResult.reason);
         }
-        for (const rawBill of billsResult.data ?? []) {
-          const bill = this.adapter.mapBill(rawBill);
-          const persisted = await this.prisma.creditCardBill.upsert({
-            where: {
-              accountId_provider_providerBillId: {
-                accountId: account.id,
-                provider: DataProvider.PLUGGY,
-                providerBillId: bill.providerBillId,
+        if (billsResult.status === 'AVAILABLE') {
+          for (const rawBill of billsResult.data) {
+            const bill = this.adapter.mapBill(rawBill);
+            const persisted = await this.prisma.creditCardBill.upsert({
+              where: {
+                accountId_provider_providerBillId: {
+                  accountId: account.id,
+                  provider: DataProvider.PLUGGY,
+                  providerBillId: bill.providerBillId,
+                },
               },
-            },
-            create: { accountId: account.id, provider: DataProvider.PLUGGY, ...bill },
-            update: { ...bill },
-          });
-          billMap.set(bill.providerBillId, persisted.id);
-          billsProcessed += 1;
+              create: { accountId: account.id, provider: DataProvider.PLUGGY, ...bill },
+              update: { ...bill },
+            });
+            billMap.set(bill.providerBillId, persisted.id);
+            billsProcessed += 1;
+          }
         }
       }
 
       const updatedIds = updatedTransactionIdsByAccount.get(mappedAccount.providerAccountId) ?? [];
-      const providerTransactions = updatedIds.length
+      const providerTransactions = this.shouldUseTargetedTransactionFetch(eventTypes, updatedIds)
         ? await this.pluggy.fetchTransactionsByIds(mappedAccount.providerAccountId, updatedIds)
         : await this.pluggy.fetchAllTransactions(mappedAccount.providerAccountId, dateFrom);
       const normalizedTransactions = providerTransactions.map((raw) =>
@@ -384,11 +399,11 @@ export class SyncService {
       }
     }
 
-    if (eventTypes.includes('transactions/deleted') && transactionIds.length) {
+    if (eventTypes.includes('transactions/deleted') && deletedTransactionIds.length) {
       await this.prisma.transaction.updateMany({
         where: {
           provider: DataProvider.PLUGGY,
-          providerTransactionId: { in: transactionIds },
+          providerTransactionId: { in: deletedTransactionIds },
           account: { connectionId },
         },
         data: { deletedAt: syncAt },
@@ -398,50 +413,54 @@ export class SyncService {
     const investmentsResult = await this.optional('investments', () =>
       this.pluggy.fetchInvestments(connection.providerItemId),
     );
-    if (investmentsResult.error) {
+    if (investmentsResult.status === 'UNAVAILABLE') {
       optionalDataUnavailable = true;
-      dataQualityReasons.push(investmentsResult.error);
+      dataQualityReasons.push(investmentsResult.reason);
     }
-    for (const rawInvestment of investmentsResult.data ?? []) {
-      const investment = this.adapter.mapInvestment(rawInvestment);
-      const persisted = await this.prisma.investment.upsert({
-        where: {
-          connectionId_provider_providerInvestmentId: {
-            connectionId,
-            provider: DataProvider.PLUGGY,
-            providerInvestmentId: investment.providerInvestmentId,
+    if (investmentsResult.status === 'AVAILABLE') {
+      for (const rawInvestment of investmentsResult.data) {
+        const investment = this.adapter.mapInvestment(rawInvestment);
+        const persisted = await this.prisma.investment.upsert({
+          where: {
+            connectionId_provider_providerInvestmentId: {
+              connectionId,
+              provider: DataProvider.PLUGGY,
+              providerInvestmentId: investment.providerInvestmentId,
+            },
           },
-        },
-        create: { connectionId, provider: DataProvider.PLUGGY, ...investment },
-        update: { ...investment },
-      });
-      await this.prisma.investmentSnapshot.upsert({
-        where: { investmentId_snapshotAt: { investmentId: persisted.id, snapshotAt: syncAt } },
-        create: { investmentId: persisted.id, snapshotAt: syncAt, balance: investment.balance },
-        update: { balance: investment.balance },
-      });
+          create: { connectionId, provider: DataProvider.PLUGGY, ...investment },
+          update: { ...investment },
+        });
+        await this.prisma.investmentSnapshot.upsert({
+          where: { investmentId_snapshotAt: { investmentId: persisted.id, snapshotAt: syncAt } },
+          create: { investmentId: persisted.id, snapshotAt: syncAt, balance: investment.balance },
+          update: { balance: investment.balance },
+        });
+      }
     }
 
     const loansResult = await this.optional('loans', () =>
       this.pluggy.fetchLoans(connection.providerItemId),
     );
-    if (loansResult.error) {
+    if (loansResult.status === 'UNAVAILABLE') {
       optionalDataUnavailable = true;
-      dataQualityReasons.push(loansResult.error);
+      dataQualityReasons.push(loansResult.reason);
     }
-    for (const rawLoan of loansResult.data ?? []) {
-      const loan = this.adapter.mapLoan(rawLoan);
-      await this.prisma.loan.upsert({
-        where: {
-          connectionId_provider_providerLoanId: {
-            connectionId,
-            provider: DataProvider.PLUGGY,
-            providerLoanId: loan.providerLoanId,
+    if (loansResult.status === 'AVAILABLE') {
+      for (const rawLoan of loansResult.data) {
+        const loan = this.adapter.mapLoan(rawLoan);
+        await this.prisma.loan.upsert({
+          where: {
+            connectionId_provider_providerLoanId: {
+              connectionId,
+              provider: DataProvider.PLUGGY,
+              providerLoanId: loan.providerLoanId,
+            },
           },
-        },
-        create: { connectionId, provider: DataProvider.PLUGGY, ...loan },
-        update: { ...loan },
-      });
+          create: { connectionId, provider: DataProvider.PLUGGY, ...loan },
+          update: { ...loan },
+        });
+      }
     }
 
     await this.detectInternalTransfers(connection.userId);
@@ -459,12 +478,16 @@ export class SyncService {
     };
   }
 
-  private async optional<T>(label: string, operation: () => Promise<T[]>) {
+  private async optional<T>(label: string, operation: () => Promise<T[]>): Promise<OptionalFetchResult<T>> {
     try {
-      return { data: await operation(), error: null };
+      return { status: 'AVAILABLE', data: await operation() };
     } catch {
       this.metrics.increment(`sync_optional_${label}_unavailable_total`);
-      return { data: null, error: `${label.toUpperCase()}_UNAVAILABLE` };
+      return {
+        status: 'UNAVAILABLE',
+        data: null,
+        reason: `${label.toUpperCase()}_UNAVAILABLE`,
+      };
     }
   }
 
@@ -533,7 +556,7 @@ export class SyncService {
   }
 
   private async markWebhookEvents(
-    syncRunId: string,
+    processedWebhookEventIds: string[],
     legacyEventId: string | null,
     status: WebhookEventStatus,
     lastError?: string,
@@ -541,7 +564,7 @@ export class SyncService {
     const where: Prisma.WebhookEventWhereInput = {
       provider: DataProvider.PLUGGY,
       OR: [
-        { syncRunId },
+        ...(processedWebhookEventIds.length ? [{ id: { in: processedWebhookEventIds } }] : []),
         ...(legacyEventId ? [{ eventId: legacyEventId }] : []),
       ],
     };
@@ -558,6 +581,43 @@ export class SyncService {
   private readStringArray(value: Prisma.JsonValue | null) {
     if (!Array.isArray(value)) return [];
     return value.filter((entry): entry is string => typeof entry === 'string' && !!entry.trim());
+  }
+
+  private deletedTransactionIds(
+    events: Array<{
+      eventType: string;
+      resourceId: string | null;
+      resourceIds: Prisma.JsonValue | null;
+    }>,
+    triggerEventType: string | null,
+    triggerResourceId: string | null,
+  ) {
+    return [
+      ...new Set([
+        ...events
+          .filter((event) => event.eventType.toLowerCase() === 'transactions/deleted')
+          .flatMap((event) => this.readStringArray(event.resourceIds)),
+        ...events
+          .filter((event) => event.eventType.toLowerCase() === 'transactions/deleted')
+          .map((event) => event.resourceId)
+          .filter((id): id is string => !!id),
+        ...(triggerEventType?.toLowerCase() === 'transactions/deleted' && triggerResourceId
+          ? [triggerResourceId]
+          : []),
+      ]),
+    ];
+  }
+
+  private shouldUseTargetedTransactionFetch(eventTypes: string[], updatedIds: string[]) {
+    if (!updatedIds.length) return false;
+    return !eventTypes.some((eventType) =>
+      [
+        'transactions/created',
+        'item/created',
+        'item/updated',
+        'accounts/updated',
+      ].includes(eventType),
+    );
   }
 
   private maxAttempts() {

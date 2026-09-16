@@ -1,5 +1,8 @@
-import { ForbiddenException } from '@nestjs/common';
-import { PluggyItemOwnershipError } from '../integrations/pluggy/pluggy.client';
+import { ForbiddenException, ServiceUnavailableException } from '@nestjs/common';
+import {
+  PluggyItemOwnershipError,
+  PluggyProviderUnavailableError,
+} from '../integrations/pluggy/pluggy.client';
 import { ConnectionsService } from './connections.service';
 
 describe('ConnectionsService provider ownership', () => {
@@ -40,5 +43,20 @@ describe('ConnectionsService provider ownership', () => {
       }),
     ).resolves.toEqual({ id: 'connection-1', status: 'PENDING' });
     expect(upsert.mock.calls[0][0].create.institution).toBe('Banco Verificado');
+  });
+
+  it('returns provider unavailability instead of misclassifying it as ownership', async () => {
+    const verifyItemOwnership = jest
+      .fn()
+      .mockRejectedValue(new PluggyProviderUnavailableError(503));
+    const service = new ConnectionsService(
+      { connection: {} } as never,
+      { verifyItemOwnership } as never,
+      {} as never,
+    );
+
+    await expect(
+      service.complete('user-1', { providerItemId: 'item-1' }),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
   });
 });

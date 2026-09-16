@@ -1,7 +1,60 @@
 import Decimal from 'decimal.js';
 import { ProviderDataError } from '../integrations/pluggy/pluggy.adapter';
+import { PluggyAdapter } from '../integrations/pluggy/pluggy.adapter';
 import { MetricsService } from '../observability/metrics.service';
 import { SyncService } from './sync.service';
+
+const makeSyncConnectionHarness = () => {
+  const prisma = {
+    connection: {
+      findUniqueOrThrow: jest.fn().mockResolvedValue({
+        id: 'connection-1',
+        providerItemId: 'item-1',
+        userId: 'user-1',
+        lastSyncedAt: null,
+      }),
+      update: jest.fn(),
+    },
+    categoryRule: { findMany: jest.fn().mockResolvedValue([]) },
+    account: { upsert: jest.fn().mockResolvedValue({ id: 'account-1' }) },
+    accountBalanceSnapshot: { upsert: jest.fn() },
+    creditCardBill: { upsert: jest.fn() },
+    transaction: {
+      upsert: jest.fn(),
+      findMany: jest.fn().mockResolvedValue([]),
+      updateMany: jest.fn(),
+    },
+    investment: { upsert: jest.fn() },
+    investmentSnapshot: { upsert: jest.fn() },
+    loan: { upsert: jest.fn() },
+  };
+  const pluggy = {
+    fetchItem: jest.fn().mockResolvedValue({}),
+    fetchAccounts: jest.fn().mockResolvedValue([
+      {
+        id: 'provider-account-1',
+        name: 'Conta',
+        type: 'CHECKING',
+        currency: 'BRL',
+        balance: '100.00',
+        availableBalance: '100.00',
+      },
+    ]),
+    fetchAllTransactions: jest.fn().mockResolvedValue([]),
+    fetchTransactionsByIds: jest.fn().mockResolvedValue([]),
+    fetchBills: jest.fn().mockResolvedValue([]),
+    fetchInvestments: jest.fn().mockResolvedValue([]),
+    fetchLoans: jest.fn().mockResolvedValue([]),
+  };
+  const service = new SyncService(
+    prisma as never,
+    pluggy as never,
+    new PluggyAdapter(),
+    {} as never,
+    new MetricsService(),
+  );
+  return { service, prisma, pluggy };
+};
 
 describe('SyncService policies', () => {
   const makeService = (prisma: unknown = {}) =>
@@ -122,6 +175,24 @@ describe('SyncService policies', () => {
     );
     expect(service['shouldRetry']({ statusCode: 503 }, 'SYNC_FAILED')).toBe(true);
     expect(service['shouldRetry']({ statusCode: 400 }, 'SYNC_FAILED')).toBe(false);
+  });
+
+  it('preserves the difference between optional empty success and provider failure', async () => {
+    const service = makeService();
+
+    await expect(service['optional']('investments', async () => [])).resolves.toEqual({
+      status: 'AVAILABLE',
+      data: [],
+    });
+    await expect(
+      service['optional']('loans', async () => {
+        throw new Error('provider outage');
+      }),
+    ).resolves.toEqual({
+      status: 'UNAVAILABLE',
+      data: null,
+      reason: 'LOANS_UNAVAILABLE',
+    });
   });
 
   it('turns item errors into explicit connection product states', async () => {
@@ -257,5 +328,146 @@ describe('SyncService policies', () => {
     expect(webhookUpdateMany).toHaveBeenLastCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ status: 'PROCESSED' }) }),
     );
+  });
+
+  it('keeps updated transaction IDs out of the deleted set', () => {
+    const service = makeService();
+
+    expect(
+      service['deletedTransactionIds'](
+        [
+          {
+            eventType: 'transactions/updated',
+            resourceId: 'TX-A',
+            resourceIds: ['TX-A'],
+          },
+          {
+            eventType: 'transactions/deleted',
+            resourceId: 'TX-B',
+            resourceIds: ['TX-B', 'TX-C', 'TX-B'],
+          },
+        ],
+        null,
+        null,
+      ),
+    ).toEqual(['TX-B', 'TX-C']);
+  });
+
+  it('uses window sync when created and updated events are coalesced', () => {
+    const service = makeService();
+
+    expect(service['shouldUseTargetedTransactionFetch'](['transactions/updated'], ['TX-A'])).toBe(
+      true,
+    );
+    expect(
+      service['shouldUseTargetedTransactionFetch'](
+        ['transactions/updated', 'transactions/created'],
+        ['TX-A'],
+      ),
+    ).toBe(false);
+  });
+
+  it('executes full transaction fetch for created plus updated events', async () => {
+    const { service, pluggy } = makeSyncConnectionHarness();
+
+    await service['syncConnection'](
+      'connection-1',
+      ['transactions/updated', 'transactions/created'],
+      [],
+      new Map([['provider-account-1', ['TX-A']]]),
+    );
+
+    expect(pluggy.fetchAllTransactions).toHaveBeenCalledTimes(1);
+    expect(pluggy.fetchTransactionsByIds).not.toHaveBeenCalled();
+  });
+
+  it('executes targeted transaction fetch for an isolated updated event', async () => {
+    const { service, pluggy } = makeSyncConnectionHarness();
+
+    await service['syncConnection'](
+      'connection-1',
+      ['transactions/updated'],
+      [],
+      new Map([['provider-account-1', ['TX-A']]]),
+    );
+
+    expect(pluggy.fetchTransactionsByIds).toHaveBeenCalledWith('provider-account-1', ['TX-A']);
+    expect(pluggy.fetchAllTransactions).not.toHaveBeenCalled();
+  });
+
+  it('applies deletion only to deleted IDs when updated and deleted events coalesce', async () => {
+    const { service, prisma } = makeSyncConnectionHarness();
+
+    await service['syncConnection'](
+      'connection-1',
+      ['transactions/updated', 'transactions/deleted'],
+      ['TX-B'],
+      new Map([['provider-account-1', ['TX-A']]]),
+    );
+
+    expect(prisma.transaction.updateMany).toHaveBeenCalledWith({
+      where: {
+        provider: 'PLUGGY',
+        providerTransactionId: { in: ['TX-B'] },
+        account: { connectionId: 'connection-1' },
+      },
+      data: { deletedAt: expect.any(Date) },
+    });
+  });
+
+  it('reports optional provider failures as partial without fabricating empty data', async () => {
+    const { service, pluggy } = makeSyncConnectionHarness();
+    pluggy.fetchInvestments.mockRejectedValue(new Error('provider unavailable'));
+
+    await expect(
+      service['syncConnection']('connection-1', [], [], new Map()),
+    ).resolves.toMatchObject({
+      dataQuality: 'PARTIAL',
+      dataQualityReasons: ['INVESTMENTS_UNAVAILABLE'],
+      counters: { investmentsProcessed: 0, loansProcessed: 0 },
+    });
+  });
+
+  it('marks only the webhook event IDs captured in the processed batch', async () => {
+    const webhookUpdateMany = jest.fn();
+    const prisma = {
+      syncRun: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'run-3',
+          status: 'RUNNING',
+          attempts: 1,
+          connectionId: 'connection-3',
+          triggerEventId: null,
+          triggerEventType: 'item/error',
+          resourceId: null,
+          errorCode: null,
+          connection: { userId: 'user-3' },
+          webhookEvents: [
+            {
+              id: 'event-captured',
+              eventType: 'item/error',
+              providerErrorCode: 'REAUTH_REQUIRED',
+              resourceIds: null,
+              resourceId: null,
+              providerAccountId: null,
+            },
+          ],
+        }),
+        update: jest.fn(),
+      },
+      connection: { update: jest.fn() },
+      webhookEvent: { updateMany: webhookUpdateMany },
+    };
+    const service = makeService(prisma);
+
+    await service.process('run-3');
+
+    expect(webhookUpdateMany).toHaveBeenCalledTimes(2);
+    for (const [args] of webhookUpdateMany.mock.calls) {
+      expect(args.where).toEqual({
+        provider: 'PLUGGY',
+        OR: [{ id: { in: ['event-captured'] } }],
+      });
+    }
   });
 });

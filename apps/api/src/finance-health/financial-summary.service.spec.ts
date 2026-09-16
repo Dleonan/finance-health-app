@@ -1,4 +1,7 @@
 import { DataQuality } from '@prisma/client';
+import Decimal from 'decimal.js';
+import { FinanceHealthService } from './finance-health.service';
+import { MetricsService } from '../observability/metrics.service';
 import { FinancialSummaryService } from './financial-summary.service';
 
 describe('FinancialSummaryService data quality', () => {
@@ -29,5 +32,55 @@ describe('FinancialSummaryService data quality', () => {
     );
     expect(service['sumKnown']([])).toBeNull();
     expect(service['sumKnown']([null])).toBeNull();
+    expect(service['sumKnown']([], new Decimal(0))?.toFixed(2)).toBe('0.00');
+  });
+
+  it('calculates net worth with known zero investments and liabilities', async () => {
+    const syncRun = {
+      status: 'SUCCEEDED',
+      dataQuality: DataQuality.COMPLETE,
+      dataQualityReasons: [],
+    };
+    const account = {
+      currency: 'BRL',
+      kind: 'CHECKING',
+      availableBalance: new Decimal('10000.00'),
+      currentBalance: new Decimal('10000.00'),
+      connection: {
+        status: 'CONNECTED',
+        lastSyncedAt: new Date('2026-09-16T12:00:00.000Z'),
+        syncRuns: [syncRun],
+      },
+    };
+    const prisma = {
+      user: {
+        findUniqueOrThrow: jest.fn().mockResolvedValue({
+          id: 'user-1',
+          timezone: 'America/Sao_Paulo',
+          baseCurrency: 'BRL',
+        }),
+      },
+      connection: { findMany: jest.fn().mockResolvedValue([{ status: 'CONNECTED', syncRuns: [syncRun] }]) },
+      account: { findMany: jest.fn().mockResolvedValue([account]) },
+      investment: { findMany: jest.fn().mockResolvedValue([]) },
+      loan: { findMany: jest.fn().mockResolvedValue([]) },
+      creditCardBill: { findMany: jest.fn().mockResolvedValue([]) },
+      transaction: { findMany: jest.fn().mockResolvedValue([]) },
+      manualFact: { findUnique: jest.fn().mockResolvedValue(null) },
+    };
+    const summary = new FinancialSummaryService(
+      prisma as never,
+      new FinanceHealthService(new MetricsService()),
+    );
+
+    await expect(summary.getSummary('user-1')).resolves.toMatchObject({
+      availableCash: '10000.00',
+      investments: '0.00',
+      liabilities: '0.00',
+      netWorth: '10000.00',
+      monthlyIncome: '0.00',
+      monthlyExpenses: '0.00',
+      creditCardExposure: '0.00',
+    });
   });
 });

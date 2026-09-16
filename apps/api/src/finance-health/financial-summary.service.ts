@@ -10,6 +10,17 @@ import { getUserMonthWindow } from './time-window';
 const DAY_MS = 24 * 60 * 60 * 1000;
 const zero = () => new Decimal(0);
 
+type LatestSyncRun = {
+  status: string;
+  dataQuality: DataQuality | null;
+  dataQualityReasons: Prisma.JsonValue | null;
+};
+
+type SummaryConnection = {
+  status: string;
+  syncRuns: LatestSyncRun[];
+};
+
 @Injectable()
 export class FinancialSummaryService {
   constructor(
@@ -23,8 +34,19 @@ export class FinancialSummaryService {
     const month = getUserMonthWindow(now, user.timezone);
     const next30 = new Date(now.getTime() + 30 * DAY_MS);
     const historyStart = new Date(month.start.getTime() - 6 * 31 * DAY_MS);
-    const [accounts, investments, loans, bills, transactions, historicalTransactions, fact] =
+    const [connections, accounts, investments, loans, bills, transactions, historicalTransactions, fact] =
       await Promise.all([
+        this.prisma.connection.findMany({
+          where: { userId },
+          select: {
+            status: true,
+            syncRuns: {
+              orderBy: { createdAt: 'desc' },
+              take: 1,
+              select: { status: true, dataQuality: true, dataQualityReasons: true },
+            },
+          },
+        }),
         this.prisma.account.findMany({
           where: { connection: { userId } },
           include: {
@@ -70,41 +92,76 @@ export class FinancialSummaryService {
         }),
       ]);
 
+    const sourceAvailability = this.sourceAvailability(connections);
     const baseCurrencyAccounts = accounts.filter(
       (account) => account.currency === user.baseCurrency,
     );
+    const cardAccounts = accounts.filter((account) => account.kind === 'CREDIT_CARD');
+    const hasUnknownCardCurrency = cardAccounts.some((account) => account.currency === null);
+    const hasUnknownTransactionCurrency = transactions.some(
+      (transaction) => transaction.account.currency === null,
+    );
+    const accountsAvailable =
+      accounts.length > 0 && sourceAvailability.accounts &&
+      !this.hasSourceUnavailableReason(connections, 'ACCOUNTS_UNAVAILABLE');
+    const transactionsAvailable =
+      accountsAvailable && sourceAvailability.transactions && !hasUnknownTransactionCurrency;
+    const billsAvailable = sourceAvailability.bills && !hasUnknownCardCurrency;
+    const investmentsAvailable =
+      sourceAvailability.investments && !investments.some((investment) => investment.currency === null);
+    const loansAvailable =
+      sourceAvailability.loans && !loans.some((loan) => loan.currency === null);
     const liquidAssets = this.sumKnown(
-      baseCurrencyAccounts
-        .filter((account) => ['CHECKING', 'SAVINGS', 'OTHER'].includes(account.kind))
-        .map((account) => account.availableBalance ?? account.currentBalance),
+      accountsAvailable && baseCurrencyAccounts.length > 0
+        ? baseCurrencyAccounts
+            .filter((account) => ['CHECKING', 'SAVINGS', 'OTHER'].includes(account.kind))
+            .map((account) => account.availableBalance ?? account.currentBalance)
+        : [],
     );
     const totalBalance = this.sumKnown(
-      baseCurrencyAccounts.map((account) => account.currentBalance),
+      accountsAvailable && baseCurrencyAccounts.length > 0
+        ? baseCurrencyAccounts.map((account) => account.currentBalance)
+        : [],
     );
     const investedAssets = this.sumKnown(
-      investments
-        .filter((investment) => investment.currency === user.baseCurrency)
-        .map((investment) => investment.snapshots[0]?.balance),
+      investmentsAvailable
+        ? investments
+            .filter((investment) => investment.currency === user.baseCurrency)
+            .map((investment) => investment.snapshots[0]?.balance)
+        : [],
+      investmentsAvailable ? zero() : null,
     );
     const baseCurrencyBills = bills.filter((bill) => bill.account.currency === user.baseCurrency);
     const baseCurrencyTransactions = transactions.filter(
       (transaction) => transaction.account.currency === user.baseCurrency,
     );
     const baseCurrencyLoans = loans.filter((loan) => loan.currency === user.baseCurrency);
-    const cardExposure = this.sumKnown(baseCurrencyBills.map((bill) => bill.totalAmount));
+    const cardExposure = !cardAccounts.length
+      ? zero()
+      : this.sumKnown(
+          billsAvailable ? baseCurrencyBills.map((bill) => bill.totalAmount) : [],
+          billsAvailable ? zero() : null,
+        );
     const loanLiabilities = this.sumKnown(
-      baseCurrencyLoans.map((loan) => loan.outstandingBalance),
+      loansAvailable ? baseCurrencyLoans.map((loan) => loan.outstandingBalance) : [],
+      loansAvailable ? zero() : null,
     );
     const liabilities = this.addKnown(cardExposure, loanLiabilities);
     const monthlyIncome = this.sumKnown(
-      baseCurrencyTransactions
-        .filter((transaction) => transaction.direction === 'INFLOW' && !transaction.isTransfer)
-        .map((transaction) => transaction.amount),
+      transactionsAvailable
+        ? baseCurrencyTransactions
+            .filter((transaction) => transaction.direction === 'INFLOW' && !transaction.isTransfer)
+            .map((transaction) => transaction.amount)
+        : [],
+      transactionsAvailable ? zero() : null,
     );
     const monthlyExpenses = this.sumKnown(
-      baseCurrencyTransactions
-        .filter((transaction) => transaction.direction === 'OUTFLOW' && !transaction.isTransfer)
-        .map((transaction) => transaction.amount),
+      transactionsAvailable
+        ? baseCurrencyTransactions
+            .filter((transaction) => transaction.direction === 'OUTFLOW' && !transaction.isTransfer)
+            .map((transaction) => transaction.amount)
+        : [],
+      transactionsAvailable ? zero() : null,
     );
     const upcomingValues = [
       ...baseCurrencyBills
@@ -116,15 +173,25 @@ export class FinancialSummaryService {
         )
         .map((loan) => loan.installment),
     ];
-    const upcomingCommitments = this.sumKnown(upcomingValues);
-    const debtService = this.sumKnown(baseCurrencyLoans.map((loan) => loan.installment));
+    const upcomingAvailable = billsAvailable && loansAvailable;
+    const upcomingCommitments = this.sumKnown(
+      upcomingAvailable ? upcomingValues : [],
+      upcomingAvailable ? zero() : null,
+    );
+    const debtService = this.sumKnown(
+      loansAvailable ? baseCurrencyLoans.map((loan) => loan.installment) : [],
+      loansAvailable ? zero() : null,
+    );
     const cardLimit = this.sumKnown(
-      baseCurrencyAccounts
-        .filter((account) => account.kind === 'CREDIT_CARD')
-        .map((account) => account.creditLimit),
+      cardAccounts.length && billsAvailable
+        ? baseCurrencyAccounts
+            .filter((account) => account.kind === 'CREDIT_CARD')
+            .map((account) => account.creditLimit)
+        : [],
+      !cardAccounts.length || (billsAvailable && !hasUnknownCardCurrency) ? zero() : null,
     );
     const hasLiquidAssets = liquidAssets !== null;
-    const hasCurrentTransactions = baseCurrencyTransactions.length > 0;
+    const hasCurrentTransactions = transactionsAvailable;
     const hasDebtService = debtService !== null;
     const hasUpcomingCommitments = upcomingCommitments !== null;
     const hasCardLimit = cardLimit !== null;
@@ -337,14 +404,52 @@ export class FinancialSummaryService {
     return DataQuality.COMPLETE;
   }
 
-  private sumKnown(values: Array<Decimal | Prisma.Decimal | null | undefined>): Decimal | null {
-    if (!values.length || values.some((value) => value === null || value === undefined)) return null;
+  private sourceAvailability(connections: SummaryConnection[]) {
+    return {
+      accounts: this.isSourceAvailable(connections, 'ACCOUNTS_UNAVAILABLE'),
+      transactions: this.isSourceAvailable(connections, 'ACCOUNTS_UNAVAILABLE'),
+      bills: this.isSourceAvailable(connections, 'BILLS_UNAVAILABLE'),
+      investments: this.isSourceAvailable(connections, 'INVESTMENTS_UNAVAILABLE'),
+      loans: this.isSourceAvailable(connections, 'LOANS_UNAVAILABLE'),
+    };
+  }
+
+  private isSourceAvailable(connections: SummaryConnection[], unavailableReason: string) {
+    if (!connections.length) return false;
+    return connections.every((connection) => {
+      if (connection.status !== 'CONNECTED') return false;
+      const run = connection.syncRuns[0];
+      if (!run || run.status !== 'SUCCEEDED') return false;
+      if (run.dataQuality === DataQuality.STALE || run.dataQuality === DataQuality.UNAVAILABLE)
+        return false;
+      return !this.hasSourceUnavailableReason([connection], unavailableReason);
+    });
+  }
+
+  private hasSourceUnavailableReason(
+    connections: SummaryConnection[],
+    unavailableReason: string,
+  ) {
+    return connections.some((connection) =>
+      connection.syncRuns.some((run) =>
+        Array.isArray(run.dataQualityReasons) &&
+        run.dataQualityReasons.some((reason) => reason === unavailableReason),
+      ),
+    );
+  }
+
+  private sumKnown(
+    values: Array<Decimal | Prisma.Decimal | null | undefined>,
+    knownEmpty: Decimal | null = null,
+  ): Decimal | null {
+    if (!values.length) return knownEmpty;
+    if (values.some((value) => value === null || value === undefined)) return null;
     return values.reduce<Decimal>((sum, value) => sum.plus(String(value)), zero());
   }
 
   private addKnown(left: Decimal | null, right: Decimal | null) {
-    if (left === null && right === null) return null;
-    return (left ?? zero()).plus(right ?? zero());
+    if (left === null || right === null) return null;
+    return left.plus(right);
   }
 
   private formatDecimal(value: Decimal | null) {

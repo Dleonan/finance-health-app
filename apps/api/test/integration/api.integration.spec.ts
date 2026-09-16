@@ -85,6 +85,6 @@ maybeDescribe('API integration', () => {
       },
       body: JSON.stringify({ providerItemId: `item-${suffix}` }),
     });
-    expect(connection.status).toBe(403);
+    expect(connection.status).toBe(503);
   });
 });
