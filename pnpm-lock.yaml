@@ -169,6 +169,9 @@ importers:
         specifier: 13.16.1
         version: 13.16.1(react-native@0.86.3(@babel/core@7.29.7(supports-color@8.1.1))(@react-native/metro-config@0.87.1(@babel/core@7.29.7(supports-color@8.1.1))(supports-color@8.1.1))(@types/react@19.2.18)(react@19.2.3)(supports-color@8.1.1))(react@19.2.3)
     devDependencies:
+      '@expo/ngrok':
+        specifier: 4.1.0
+        version: 4.1.0
       '@types/node':
         specifier: ^22.0.0
         version: 22.20.2
@@ -825,6 +828,69 @@ packages:
 
   '@expo/metro@56.0.2':
     resolution: {integrity: sha512-Ld5AeYMCCDa8bLeWhfuLbZFFjlV3f6ORqyPz2glGh6RltIngMuLf9BTC2yvHFjkKuGxL5SynijmA8xmNNWn5iA==}
+
+  '@expo/ngrok-bin-darwin-arm64@2.3.40':
+    resolution: {integrity: sha512-Zij81v/bIsVBvgXgYS71xbi/3lqKfVEfr7rId8BsHO3Ec1nQcp/I+729W3KX9PUHzWlXCLxOKZ3uF4jL/TcNbg==}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@expo/ngrok-bin-darwin-x64@2.3.40':
+    resolution: {integrity: sha512-nqGLfxIjZBoT79VDk5mqaHQKCWkunSi486zGLeB8Ye8Qar1yo4STFwks+DqTbnGD5ItArQz2LzKRVE4YXuJFuw==}
+    cpu: [x64]
+    os: [darwin]
+
+  '@expo/ngrok-bin-freebsd-ia32@2.3.40':
+    resolution: {integrity: sha512-Ji3jZaOuIZO+ege23kZZAAEPUYkF+6mCpghb16b28Is1QHOSl2L4foDnAcWyzSEiBihMicxWltaQyaaxA0fdgw==}
+    cpu: [ia32]
+    os: [freebsd]
+
+  '@expo/ngrok-bin-freebsd-x64@2.3.40':
+    resolution: {integrity: sha512-mVnzKGQmOyXimZx6udoiyo3ZTYLZnPShlTySaDP0tqQ0vYz4ZscgvaYpMmDSPrsP/YG2owmKgzmOE2V+ycD8qA==}
+    cpu: [x64]
+    os: [freebsd]
+
+  '@expo/ngrok-bin-linux-arm64@2.3.40':
+    resolution: {integrity: sha512-S6kbnRqsVXHo/bWNxc0jfq33aQQRsGWjb6e7SvZ2DgXsPFLn27cfK0eHD96uCssARDVhzPsc+VU/B3d8C1DT5A==}
+    cpu: [arm64]
+    os: [linux]
+
+  '@expo/ngrok-bin-linux-arm@2.3.40':
+    resolution: {integrity: sha512-Je1QBd7x0hbZa4T3gZbVgD0cSzstpJ7Mu0+dM2lOB+vm3bd603yHtD0RlLdqARJFhPTE1M2zLd68gCEeZ5fRgQ==}
+    cpu: [arm]
+    os: [linux]
+
+  '@expo/ngrok-bin-linux-ia32@2.3.40':
+    resolution: {integrity: sha512-gPY5zv5Fu+TkCm5iZolXQbu7e5hc7fTllIKn/zJQxxZs/WCvSxyB5ip6vQcHiavu/kjr0HtNciPX/guXvWENkg==}
+    cpu: [ia32]
+    os: [linux]
+
+  '@expo/ngrok-bin-linux-x64@2.3.40':
+    resolution: {integrity: sha512-yOuwpOmMe6RGnk9ninlM7Zg1EiF81ptFOcFmT61PDOA4gK8/ttZKTMkDQiq0DZdcXUyE0HCr83EglJZTnHIzPA==}
+    cpu: [x64]
+    os: [linux]
+
+  '@expo/ngrok-bin-sunos-x64@2.3.40':
+    resolution: {integrity: sha512-0itEIQ7KsxRbF9nJk6tt0Ey+9TDC5H7krOsy3t7DPx01EvtaiEdMyhmE1XWjBtwr8+BaY9CpEhUWkx4iCcE4cw==}
+    cpu: [x64]
+    os: [sunos]
+
+  '@expo/ngrok-bin-win32-ia32@2.3.40':
+    resolution: {integrity: sha512-RAunwOAskfU0R5mYlxxB+bihLJ4nLRx5/x+q5nIq1muYmaqLvGtkQQHZKzgHJANJ7ZIbzfJY57IN2UICpibgIQ==}
+    cpu: [ia32]
+    os: [win32]
+
+  '@expo/ngrok-bin-win32-x64@2.3.40':
+    resolution: {integrity: sha512-a8xtUxX/Ftp2ho+/+VR5GCg0ttP9MNzYj58TVjfiKMkl4mVrbFVIzEinRzmy7PhiOWxqGQSCOdzEfa6C2G4nEA==}
+    cpu: [x64]
+    os: [win32]
+
+  '@expo/ngrok-bin@2.3.40':
+    resolution: {integrity: sha512-40GK1CY1QLPDHSQS7Fd36CJeZgMwtbeezkgp4tzfExVRVtWw30jOBCsM7TBB9IqEmmX7C/XwG47scMQHCnMw8A==}
+    hasBin: true
+
+  '@expo/ngrok@4.1.0':
+    resolution: {integrity: sha512-PrtWxBt/SnOF1jZkf7oWznhEPFrmYKKeJPLVRKnEBd/y4eUYfoiNIXOzflIzhdrMubjWVI+pFuPJ6nkjVL95/Q==}
+    engines: {node: '>=10.19.0'}
 
   '@expo/osascript@2.7.1':
     resolution: {integrity: sha512-Zn03EX6In7ts2lPUW2ESUSkEhEWQN1qqsiXjadtZMJOuZRkMiAg1ZQHuvz9DjByDWNJ2pBwAGyrts9lj9k389g==}
@@ -5082,6 +5148,11 @@ packages:
     resolution: {integrity: sha512-pMZTvIkT1d+TFGvDOqodOclx0QWkkgi6Tdoa8gC8ffGAAqz9pzPTZWAybbsHHoED/ztMtkv/VoYTYyShUn81hA==}
     engines: {node: '>= 0.4.0'}
 
+  uuid@3.4.0:
+    resolution: {integrity: sha512-HjSDRw6gZE5JMggctHBcjVak08+KEVhSIiDzFnT9S9aegmp85S/bReBVTb4QTFaRNptJ9kuYaNhnbNEOkbKb/A==}
+    deprecated: uuid@10 and below is no longer supported.  For ESM codebases, update to uuid@latest.  For CommonJS codebases, use uuid@11 (but be aware this version will likely be deprecated in 2028).
+    hasBin: true
+
   uuid@7.0.3:
     resolution: {integrity: sha512-DPSke0pXhTZgoF/d+WSt2QaKMCFSfx7QegxEWT+JOuHF5aWrKEn0G+ztjuJg/gG8/ItK+rbPCD/yNv8yyih6Cg==}
     deprecated: uuid@10 and below is no longer supported.  For ESM codebases, update to uuid@latest.  For CommonJS codebases, use uuid@11 (but be aware this version will likely be deprecated in 2028).
@@ -5239,6 +5310,10 @@ packages:
 
   yallist@3.1.1:
     resolution: {integrity: sha512-a4UGQaWPH59mOXUYnAG2ewncQS4i4F43Tv3JoAM+s2VDAmS9NsK8GpDMLrCHPksFT7h3K6TOoUNn2pb7RoXx4g==}
+
+  yaml@1.10.3:
+    resolution: {integrity: sha512-vIYeF1u3CjlhAFekPPAk2h/Kv4T3mAkMox5OymRiJQB0spDP10LHvt+K7G9Ny6NuuMAb25/6n1qyUjAcGNf/AA==}
+    engines: {node: '>= 6'}
 
   yaml@2.9.1:
     resolution: {integrity: sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw==}
@@ -6222,6 +6297,60 @@ snapshots:
       - bufferutil
       - supports-color
       - utf-8-validate
+
+  '@expo/ngrok-bin-darwin-arm64@2.3.40':
+    optional: true
+
+  '@expo/ngrok-bin-darwin-x64@2.3.40':
+    optional: true
+
+  '@expo/ngrok-bin-freebsd-ia32@2.3.40':
+    optional: true
+
+  '@expo/ngrok-bin-freebsd-x64@2.3.40':
+    optional: true
+
+  '@expo/ngrok-bin-linux-arm64@2.3.40':
+    optional: true
+
+  '@expo/ngrok-bin-linux-arm@2.3.40':
+    optional: true
+
+  '@expo/ngrok-bin-linux-ia32@2.3.40':
+    optional: true
+
+  '@expo/ngrok-bin-linux-x64@2.3.40':
+    optional: true
+
+  '@expo/ngrok-bin-sunos-x64@2.3.40':
+    optional: true
+
+  '@expo/ngrok-bin-win32-ia32@2.3.40':
+    optional: true
+
+  '@expo/ngrok-bin-win32-x64@2.3.40':
+    optional: true
+
+  '@expo/ngrok-bin@2.3.40':
+    optionalDependencies:
+      '@expo/ngrok-bin-darwin-arm64': 2.3.40
+      '@expo/ngrok-bin-darwin-x64': 2.3.40
+      '@expo/ngrok-bin-freebsd-ia32': 2.3.40
+      '@expo/ngrok-bin-freebsd-x64': 2.3.40
+      '@expo/ngrok-bin-linux-arm': 2.3.40
+      '@expo/ngrok-bin-linux-arm64': 2.3.40
+      '@expo/ngrok-bin-linux-ia32': 2.3.40
+      '@expo/ngrok-bin-linux-x64': 2.3.40
+      '@expo/ngrok-bin-sunos-x64': 2.3.40
+      '@expo/ngrok-bin-win32-ia32': 2.3.40
+      '@expo/ngrok-bin-win32-x64': 2.3.40
+
+  '@expo/ngrok@4.1.0':
+    dependencies:
+      '@expo/ngrok-bin': 2.3.40
+      got: 11.8.6
+      uuid: 3.4.0
+      yaml: 1.10.3
 
   '@expo/osascript@2.7.1':
     dependencies:
@@ -11177,6 +11306,8 @@ snapshots:
 
   utils-merge@1.0.1: {}
 
+  uuid@3.4.0: {}
+
   uuid@7.0.3: {}
 
   v8-compile-cache-lib@3.0.1: {}
@@ -11329,6 +11460,8 @@ snapshots:
   y18n@5.0.8: {}
 
   yallist@3.1.1: {}
+
+  yaml@1.10.3: {}
 
   yaml@2.9.1: {}
 

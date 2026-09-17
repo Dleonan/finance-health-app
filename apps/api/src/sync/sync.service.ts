@@ -146,8 +146,31 @@ export class SyncService {
     } catch (error) {
       const errorCode =
         error instanceof ProviderDataError ? 'PROVIDER_DATA_INVALID' : 'SYNC_FAILED';
+      const errorRecord =
+        error && typeof error === 'object' ? (error as Record<string, unknown>) : {};
+      const responseRecord =
+        errorRecord.response && typeof errorRecord.response === 'object'
+          ? (errorRecord.response as Record<string, unknown>)
+          : {};
+      const detailCode =
+        typeof errorRecord.code === 'string'
+          ? errorRecord.code
+          : typeof responseRecord.code === 'string'
+            ? responseRecord.code
+            : 'UNKNOWN';
+      const validationHint =
+        error instanceof Prisma.PrismaClientValidationError
+          ? error.message.match(
+              /Unknown argument `[^`]+`|Argument `[^`]+` of type [^ ]+ is missing|Invalid value provided\. Expected [^\n]+/,
+            )?.[0] ?? 'VALIDATION_ERROR'
+          : null;
+      const detailStatus = this.number(
+        errorRecord.statusCode ?? errorRecord.status ?? responseRecord.status,
+      );
       this.logger.error(
-        `sync failed run=${run.id} connection=${run.connectionId} code=${errorCode}`,
+        `sync failed run=${run.id} connection=${run.connectionId} code=${errorCode} ` +
+          `kind=${error instanceof Error ? error.name : typeof error} ` +
+          `detail=${validationHint ?? detailCode} status=${detailStatus ?? 'UNKNOWN'}`,
       );
       if (this.shouldRetry(error, errorCode) && run.attempts < this.maxAttempts()) {
         const nextAttemptAt = new Date(Date.now() + this.backoffMs(run.attempts));
@@ -510,8 +533,19 @@ export class SyncService {
               providerInvestmentId: investment.providerInvestmentId,
             },
           },
-          create: { connectionId, provider: DataProvider.PLUGGY, ...investment },
-          update: { ...investment },
+          create: {
+            connectionId,
+            provider: DataProvider.PLUGGY,
+            providerInvestmentId: investment.providerInvestmentId,
+            type: investment.type,
+            name: investment.name,
+            currency: investment.currency,
+          },
+          update: {
+            type: investment.type,
+            name: investment.name,
+            currency: investment.currency,
+          },
         });
         await this.prisma.investmentSnapshot.upsert({
           where: { investmentId_snapshotAt: { investmentId: persisted.id, snapshotAt: syncAt } },

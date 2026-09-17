@@ -144,6 +144,8 @@ function DashboardScreen() {
         <PluggyConnect
           connectToken={connectToken}
           language="pt"
+          includeSandbox={__DEV__}
+          forceOauthInBrowser={false}
           onClose={() => setConnectToken(null)}
           onSuccess={async ({ item }) => {
             try {
@@ -163,9 +165,10 @@ function DashboardScreen() {
               setConnectToken(null);
             }
           }}
-          onError={() => {
+          onError={(error) => {
             setConnectToken(null);
-            Alert.alert('Erro na conexão', 'A instituição não foi conectada.');
+            const message = error.message?.trim() || 'A instituição não foi conectada.';
+            Alert.alert('Erro na conexão', message);
           }}
         />
       </SafeAreaView>
