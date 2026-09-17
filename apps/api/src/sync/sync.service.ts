@@ -5,10 +5,10 @@ import {
   ConnectionStatus,
   DataProvider,
   DataQuality,
+  Prisma,
   SyncRunStatus,
   WebhookEventStatus,
 } from '@prisma/client';
-import type { Prisma } from '@prisma/client';
 import { PrismaService } from '../database/prisma.service';
 import { PluggyAdapter } from '../integrations/pluggy/pluggy.adapter';
 import { ProviderDataError } from '../integrations/pluggy/pluggy.adapter';
@@ -151,25 +151,10 @@ export class SyncService {
       );
       if (this.shouldRetry(error, errorCode) && run.attempts < this.maxAttempts()) {
         const nextAttemptAt = new Date(Date.now() + this.backoffMs(run.attempts));
-        await this.prisma.syncRun.update({
-          where: { id: run.id },
-          data: {
-            status: SyncRunStatus.QUEUED,
-            finishedAt: null,
-            nextAttemptAt,
-            errorCode,
-            errorMessage: 'Temporary sync failure; retry scheduled',
-          },
-        });
-        await this.prisma.connection.update({
-          where: { id: run.connectionId },
-          data: { status: ConnectionStatus.PENDING },
-        });
-        await this.markWebhookEvents(
+        await this.rescheduleTransientFailure(
+          run,
           processedWebhookEventIds,
-          run.triggerEventId,
-          WebhookEventStatus.RECEIVED,
-          'SYNC_RETRY_SCHEDULED',
+          nextAttemptAt,
         );
         this.metrics.increment('sync_retry_scheduled_total');
       } else {
@@ -201,6 +186,103 @@ export class SyncService {
       }
       this.metrics.observe('sync_duration_ms', Date.now() - startedAt);
     }
+  }
+
+  private async rescheduleTransientFailure(
+    run: { id: string; connectionId: string; attempts: number },
+    processedWebhookEventIds: string[],
+    nextAttemptAt: Date,
+  ) {
+    for (let transactionAttempt = 0; transactionAttempt < 3; transactionAttempt += 1) {
+      try {
+        return await this.prisma.$transaction(async (tx) => {
+          const queued = await tx.syncRun.findFirst({
+            where: {
+              connectionId: run.connectionId,
+              status: SyncRunStatus.QUEUED,
+              id: { not: run.id },
+            },
+            orderBy: { createdAt: 'asc' },
+          });
+          const retryError =
+            'Temporary failure; retry coalesced into queued run';
+
+          if (queued) {
+            if (processedWebhookEventIds.length) {
+              await tx.webhookEvent.updateMany({
+                where: {
+                  provider: DataProvider.PLUGGY,
+                  id: { in: processedWebhookEventIds },
+                },
+                data: {
+                  syncRunId: queued.id,
+                  status: WebhookEventStatus.RECEIVED,
+                  processedAt: null,
+                  lastError: 'SYNC_RETRY_SCHEDULED',
+                },
+              });
+            }
+            await tx.syncRun.update({
+              where: { id: queued.id },
+              data: {
+                nextAttemptAt: queued.nextAttemptAt
+                  ? new Date(Math.min(queued.nextAttemptAt.getTime(), nextAttemptAt.getTime()))
+                  : null,
+                errorCode: 'SYNC_RETRY_COALESCED',
+                errorMessage: retryError,
+              },
+            });
+            await tx.syncRun.update({
+              where: { id: run.id },
+              data: {
+                status: SyncRunStatus.FAILED,
+                finishedAt: new Date(),
+                nextAttemptAt: null,
+                errorCode: 'SYNC_RETRY_COALESCED',
+                errorMessage: retryError,
+              },
+            });
+            await tx.connection.update({
+              where: { id: run.connectionId },
+              data: { status: ConnectionStatus.PENDING },
+            });
+            return { coalesced: true, queuedRunId: queued.id };
+          }
+
+          await tx.syncRun.update({
+            where: { id: run.id },
+            data: {
+              status: SyncRunStatus.QUEUED,
+              finishedAt: null,
+              nextAttemptAt,
+              errorCode: 'SYNC_FAILED',
+              errorMessage: 'Temporary sync failure; retry scheduled',
+            },
+          });
+          if (processedWebhookEventIds.length) {
+            await tx.webhookEvent.updateMany({
+              where: {
+                provider: DataProvider.PLUGGY,
+                id: { in: processedWebhookEventIds },
+              },
+              data: {
+                status: WebhookEventStatus.RECEIVED,
+                processedAt: null,
+                lastError: 'SYNC_RETRY_SCHEDULED',
+              },
+            });
+          }
+          await tx.connection.update({
+            where: { id: run.connectionId },
+            data: { status: ConnectionStatus.PENDING },
+          });
+          return { coalesced: false, queuedRunId: run.id };
+        });
+      } catch (error) {
+        if (!this.isUniqueConstraintError(error) || transactionAttempt === 2) throw error;
+      }
+    }
+    throw new Error('Transient sync retry could not be scheduled');
   }
 
   private async syncConnection(
@@ -640,6 +722,15 @@ export class SyncService {
     if (status === undefined) return true;
     if (status === 408 || status === 409 || status === 425 || status === 429) return true;
     return status >= 500;
+  }
+
+  private isUniqueConstraintError(error: unknown) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError) return error.code === 'P2002';
+    return (
+      !!error &&
+      typeof error === 'object' &&
+      (error as Record<string, unknown>).code === 'P2002'
+    );
   }
 
   private number(value: unknown) {

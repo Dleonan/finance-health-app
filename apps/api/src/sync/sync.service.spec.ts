@@ -1,4 +1,5 @@
 import Decimal from 'decimal.js';
+import { Prisma } from '@prisma/client';
 import { ProviderDataError } from '../integrations/pluggy/pluggy.adapter';
 import { PluggyAdapter } from '../integrations/pluggy/pluggy.adapter';
 import { MetricsService } from '../observability/metrics.service';
@@ -220,7 +221,7 @@ describe('SyncService policies', () => {
     const syncRunUpdate = jest.fn();
     const connectionUpdate = jest.fn();
     const webhookUpdateMany = jest.fn();
-    const prisma = {
+    const prisma: unknown = {
       syncRun: {
         findUnique: jest.fn().mockResolvedValue({
           id: 'run-1',
@@ -232,12 +233,23 @@ describe('SyncService policies', () => {
           resourceId: null,
           errorCode: null,
           connection: { userId: 'user-1' },
-          webhookEvents: [],
+          webhookEvents: [
+            {
+              id: 'event-retry',
+              eventType: 'transactions/updated',
+              providerErrorCode: null,
+              resourceIds: null,
+              resourceId: null,
+              providerAccountId: 'provider-account-1',
+            },
+          ],
         }),
+        findFirst: jest.fn().mockResolvedValue(null),
         update: syncRunUpdate,
       },
       connection: { update: connectionUpdate },
       webhookEvent: { updateMany: webhookUpdateMany },
+      $transaction: jest.fn(async (callback: (tx: unknown) => unknown) => callback(prisma)),
     };
     const service = new SyncService(
       prisma as never,
@@ -272,7 +284,7 @@ describe('SyncService policies', () => {
     const syncRunUpdate = jest.fn();
     const connectionUpdate = jest.fn();
     const webhookUpdateMany = jest.fn();
-    const prisma = {
+    const prisma: unknown = {
       syncRun: {
         findUnique: jest.fn().mockResolvedValue({
           id: 'run-2',
@@ -430,7 +442,7 @@ describe('SyncService policies', () => {
 
   it('marks only the webhook event IDs captured in the processed batch', async () => {
     const webhookUpdateMany = jest.fn();
-    const prisma = {
+    const prisma: unknown = {
       syncRun: {
         findUnique: jest.fn().mockResolvedValue({
           id: 'run-3',
@@ -469,5 +481,252 @@ describe('SyncService policies', () => {
         OR: [{ id: { in: ['event-captured'] } }],
       });
     }
+  });
+
+  it('coalesces a transient retry into an existing queued run atomically', async () => {
+    const eventA = {
+      id: 'event-a',
+      syncRunId: 'run-a',
+      status: 'RECEIVED',
+      lastError: null,
+      eventType: 'transactions/updated',
+      providerErrorCode: null,
+      resourceIds: null,
+      resourceId: null,
+      providerAccountId: 'provider-account-1',
+    };
+    const eventB = {
+      id: 'event-b',
+      syncRunId: 'run-b',
+      status: 'RECEIVED',
+      eventType: 'transactions/created',
+      providerErrorCode: null,
+      resourceIds: null,
+      resourceId: null,
+      providerAccountId: 'provider-account-1',
+    };
+    const laterQueuedAttempt = new Date(Date.now() + 60_000);
+    const runA = {
+      id: 'run-a',
+      status: 'RUNNING',
+      attempts: 1,
+      connectionId: 'connection-retry',
+      triggerEventId: null,
+      triggerEventType: 'transactions/updated',
+      resourceId: null,
+      errorCode: null,
+      connection: { userId: 'user-retry' },
+      webhookEvents: [eventA],
+    };
+    const runB = {
+      id: 'run-b',
+      status: 'QUEUED',
+      nextAttemptAt: laterQueuedAttempt,
+      webhookEvents: [eventB],
+    };
+    const syncRunFindFirst = jest.fn().mockResolvedValue(runB);
+    const syncRunUpdate = jest.fn().mockImplementation(async ({ where, data }) => {
+      Object.assign(where.id === runA.id ? runA : runB, data);
+      return where.id === runA.id ? runA : runB;
+    });
+    const connection = { status: 'SYNCING' };
+    const connectionUpdate = jest.fn().mockImplementation(async ({ data }) => {
+      Object.assign(connection, data);
+    });
+    const webhookUpdateMany = jest.fn().mockImplementation(async ({ where, data }) => {
+      const ids = where.id?.in ?? where.OR?.[0]?.id?.in ?? [];
+      for (const event of [eventA, eventB]) {
+        if (ids.includes(event.id)) Object.assign(event, data);
+      }
+    });
+    const prisma: unknown = {
+      syncRun: {
+        findUnique: jest.fn().mockResolvedValue(runA),
+        findFirst: syncRunFindFirst,
+        update: syncRunUpdate,
+      },
+      connection: { update: connectionUpdate },
+      webhookEvent: { updateMany: webhookUpdateMany },
+      $transaction: jest.fn(async (callback: (tx: unknown) => unknown) => callback(prisma)),
+    };
+    const metrics = new MetricsService();
+    const service = new SyncService(
+      prisma as never,
+      { fetchItem: jest.fn().mockRejectedValue({ statusCode: 503 }) } as never,
+      {} as never,
+      {} as never,
+      metrics,
+    );
+
+    await expect(service.process('run-a')).resolves.toBeUndefined();
+
+    expect(syncRunFindFirst).toHaveBeenCalledWith({
+      where: {
+        connectionId: 'connection-retry',
+        status: 'QUEUED',
+        id: { not: 'run-a' },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    expect(runA.status).toBe('FAILED');
+    expect(runA.errorCode).toBe('SYNC_RETRY_COALESCED');
+    expect(runB.status).toBe('QUEUED');
+    expect(runB.nextAttemptAt).toBeInstanceOf(Date);
+    expect((runB.nextAttemptAt as Date).getTime()).toBeLessThanOrEqual(
+      laterQueuedAttempt.getTime(),
+    );
+    expect(eventA.syncRunId).toBe('run-b');
+    expect(eventA.status).toBe('RECEIVED');
+    expect(eventA.lastError).toBe('SYNC_RETRY_SCHEDULED');
+    expect(eventB.syncRunId).toBe('run-b');
+    expect(eventB.status).toBe('RECEIVED');
+    expect(connection.status).toBe('PENDING');
+    expect(metrics.snapshot().counters.sync_retry_scheduled_total).toBe(1);
+    expect(metrics.snapshot().counters.sync_failed_total).toBeUndefined();
+  });
+
+  it('reprocesses both original and queued webhook batches to success after coalescing', async () => {
+    const eventA = {
+      id: 'event-a2',
+      syncRunId: 'run-a2',
+      status: 'RECEIVED',
+      lastError: null,
+      eventType: 'transactions/updated',
+      providerErrorCode: null,
+      resourceIds: null,
+      resourceId: null,
+      providerAccountId: 'provider-account-1',
+    };
+    const eventB = {
+      id: 'event-b2',
+      syncRunId: 'run-b2',
+      status: 'RECEIVED',
+      eventType: 'transactions/created',
+      providerErrorCode: null,
+      resourceIds: null,
+      resourceId: null,
+      providerAccountId: 'provider-account-1',
+    };
+    const runA = {
+      id: 'run-a2',
+      status: 'RUNNING',
+      attempts: 1,
+      connectionId: 'connection-retry-2',
+      triggerEventId: null,
+      triggerEventType: 'transactions/updated',
+      resourceId: null,
+      errorCode: null,
+      connection: { userId: 'user-retry-2' },
+      webhookEvents: [eventA],
+    };
+    const runB = {
+      id: 'run-b2',
+      status: 'QUEUED',
+      nextAttemptAt: null as Date | null,
+      triggerEventId: null,
+      triggerEventType: 'transactions/created',
+      resourceId: null,
+      errorCode: null,
+      connection: { userId: 'user-retry-2' },
+      webhookEvents: [eventB],
+    };
+    const connection = { status: 'SYNCING' };
+    const syncRunUpdate = jest.fn().mockImplementation(async ({ where, data }) => {
+      const target = where.id === runA.id ? runA : runB;
+      Object.assign(target, data);
+      return target;
+    });
+    const webhookUpdateMany = jest.fn().mockImplementation(async ({ where, data }) => {
+      const ids = where.id?.in ?? where.OR?.[0]?.id?.in ?? [];
+      for (const event of [eventA, eventB]) {
+        if (ids.includes(event.id)) Object.assign(event, data);
+      }
+    });
+    const prisma: unknown = {
+      syncRun: {
+        findUnique: jest.fn().mockImplementation(({ where }) =>
+          where.id === runA.id ? runA : runB,
+        ),
+        findFirst: jest.fn().mockResolvedValue(runB),
+        update: syncRunUpdate,
+      },
+      connection: {
+        update: jest.fn().mockImplementation(async ({ data }) => Object.assign(connection, data)),
+      },
+      webhookEvent: { updateMany: webhookUpdateMany },
+      $transaction: jest.fn(async (callback: (tx: unknown) => unknown) => callback(prisma)),
+    };
+    const service = new SyncService(
+      prisma as never,
+      {} as never,
+      {} as never,
+      { persistSnapshot: jest.fn() } as never,
+      new MetricsService(),
+    );
+    const successfulOutcome = {
+      counters: {
+        accountsProcessed: 1,
+        transactionsProcessed: 1,
+        billsProcessed: 0,
+        investmentsProcessed: 0,
+        loansProcessed: 0,
+      },
+      dataQuality: 'COMPLETE',
+    };
+    jest
+      .spyOn(
+        service as unknown as { syncConnection: jest.Mock },
+        'syncConnection',
+      )
+      .mockRejectedValueOnce({ statusCode: 503 })
+      .mockResolvedValueOnce(successfulOutcome as never);
+
+    await service.process('run-a2');
+    runB.status = 'RUNNING';
+    runB.webhookEvents = [eventA, eventB];
+    await service.process('run-b2');
+
+    expect(runA.status).toBe('FAILED');
+    expect(runB.status).toBe('SUCCEEDED');
+    expect(eventA.syncRunId).toBe('run-b2');
+    expect(eventB.syncRunId).toBe('run-b2');
+    expect(eventA.status).toBe('PROCESSED');
+    expect(eventB.status).toBe('PROCESSED');
+    expect(connection.status).toBe('CONNECTED');
+  });
+
+  it('retries the retry transaction when a queued unique constraint race raises P2002', async () => {
+    const duplicate = new Prisma.PrismaClientKnownRequestError('duplicate', {
+      code: 'P2002',
+      clientVersion: 'test',
+    });
+    const transaction = jest
+      .fn();
+    const prisma: unknown = {
+      syncRun: {
+        findFirst: jest.fn().mockResolvedValue({
+          id: 'run-b3',
+          status: 'QUEUED',
+          nextAttemptAt: null,
+        }),
+        update: jest.fn(),
+      },
+      connection: { update: jest.fn() },
+      webhookEvent: { updateMany: jest.fn() },
+      $transaction: transaction,
+    };
+    transaction
+      .mockRejectedValueOnce(duplicate)
+      .mockImplementationOnce(async (callback: (tx: unknown) => unknown) => callback(prisma));
+    const service = makeService(prisma);
+
+    await expect(
+      service['rescheduleTransientFailure'](
+        { id: 'run-a3', connectionId: 'connection-retry-3', attempts: 1 },
+        ['event-a3'],
+        new Date(Date.now() + 5_000),
+      ),
+    ).resolves.toMatchObject({ coalesced: true, queuedRunId: 'run-b3' });
+    expect(transaction).toHaveBeenCalledTimes(2);
   });
 });
